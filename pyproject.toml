@@ -19,5 +19,5 @@ classifiers = [
 Repository = "https://github.com/xiaolibai-sys/ComfyUI-MiniMaxH3"
 
 [tool.comfy]
-PublisherId = "xiaolibai-sys"
+PublisherId = "wen"
 DisplayName = "MiniMax H3"
