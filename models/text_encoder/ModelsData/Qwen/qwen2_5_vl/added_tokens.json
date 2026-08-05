@@ -1,0 +1,200 @@
+[
+ {
+  "id": 151643,
+  "content": "<|endoftext|>",
+  "single_word": false,
+  "lstrip": false,
+  "rstrip": false,
+  "normalized": false,
+  "special": true
+ },
+ {
+  "id": 151644,
+  "content": "<|im_start|>",
+  "single_word": false,
+  "lstrip": false,
+  "rstrip": false,
+  "normalized": false,
+  "special": true
+ },
+ {
+  "id": 151645,
+  "content": "<|im_end|>",
+  "single_word": false,
+  "lstrip": false,
+  "rstrip": false,
+  "normalized": false,
+  "special": true
+ },
+ {
+  "id": 151646,
+  "content": "<|object_ref_start|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151647,
+  "content": "<|object_ref_end|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151648,
+  "content": "<|box_start|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151649,
+  "content": "<|box_end|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151650,
+  "content": "<|quad_start|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151651,
+  "content": "<|quad_end|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151652,
+  "content": "<|vision_start|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151653,
+  "content": "<|vision_end|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151654,
+  "content": "<|vision_pad|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151655,
+  "content": "<|image_pad|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151656,
+  "content": "<|video_pad|>",
+  "normalized": false,
+  "lstrip": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": true
+ },
+ {
+  "id": 151657,
+  "content": "<tool_call>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151658,
+  "content": "</tool_call>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151659,
+  "content": "<|fim_prefix|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151660,
+  "content": "<|fim_middle|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151661,
+  "content": "<|fim_suffix|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151662,
+  "content": "<|fim_pad|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151663,
+  "content": "<|repo_name|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ },
+ {
+  "id": 151664,
+  "content": "<|file_sep|>",
+  "lstrip": false,
+  "normalized": false,
+  "rstrip": false,
+  "single_word": false,
+  "special": false
+ }
+]

@@ -1,0 +1,23 @@
+[project]
+# Registry node id. Rename before the first publish if this name is taken.
+name = "minimax-h3"
+version = "1.0.0"
+description = "MiniMax H3 video and audio generation nodes for ComfyUI"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "safetensors>=0.4",
+    "numpy",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+# license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/xiaolibai-sys/ComfyUI-MiniMaxH3"
+
+[tool.comfy]
+PublisherId = "xiaolibai-sys"
+DisplayName = "MiniMax H3"

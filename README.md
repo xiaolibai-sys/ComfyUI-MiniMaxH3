@@ -1,0 +1,164 @@
+# ComfyUI-MiniMaxH3
+
+ComfyUI custom nodes for MiniMax H3 joint video and audio generation.
+
+The package includes streaming model loading, BlockSwap, quantized weight
+support, a vendored Qwen3-VL-32B text encoder, prompt and storyboard tools,
+Refiner nodes, an H3 KSampler, decode, and output utilities.
+
+## Installation
+
+1. Copy the repository folder into `ComfyUI/custom_nodes/`.
+2. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. Restart ComfyUI.
+
+## Model Files
+
+Place model files in the standard ComfyUI model folders:
+
+| Model | Folder |
+|---|---|
+| DiT / Ref2VA checkpoint | `ComfyUI/models/diffusion_models/` |
+| Qwen3-VL text encoder | `ComfyUI/models/text_encoders/` |
+| Video VAE and audio VAE | `ComfyUI/models/vae/` |
+
+Supported DiT weight formats are detected automatically from checkpoint
+metadata: bf16, fp16, fp8, int8, nvfp4, and convrot.
+
+## API Keys
+
+- `MiniMax H3 Context IR Refiner` reads the API key from the `IR_KEY`
+  environment variable.
+- `MiniMax H3 OpenAI-Compatible Refiner` reads the API key from a user-selected
+  environment variable.
+
+API keys are not stored in workflow JSON.
+
+## Nodes
+
+| Node | Purpose |
+|---|---|
+| MiniMax H3 Model Loader (Streaming) | Loads the DiT lazily with BlockSwap support |
+| MiniMax H3 VAE Loader | References video and audio VAE weights |
+| MiniMax H3 Text Encoder Loader | Loads the vendored Qwen3-VL-32B encoder |
+| MiniMax H3 Attention Config | Selects an attention backend with automatic fallback |
+| MiniMax H3 Conditioning | Builds positive/negative conditioning and the AV latent |
+| MiniMax H3 FL Constraint | Provides first-frame and/or last-frame constraints |
+| MiniMax H3 PackageData | Combines UI-loaded and external image/video/audio references |
+| MiniMax H3 Storyboard | Structured multi-shot storyboard editor |
+| MiniMax H3 Simple Prompt | Builds a simple T2VA/I2VA/FL2VA/L2VA prompt payload |
+| MiniMax H3 VideoBatch | Packs up to three independent video references |
+| MiniMax H3 Context IR Refiner | Calls the official MiniMax H3 Context IR API |
+| MiniMax H3 OpenAI-Compatible Refiner | Calls any OpenAI-compatible chat API |
+| MiniMax H3 KSampler | Runs the H3 packed AV sampler through ComfyUI k-diffusion |
+| MiniMax H3 TeaCache Args | Configures TeaCache block skipping |
+| MiniMax H3 BlockSwap Args | Configures BlockSwap, prefetch, pinning, and dtype |
+| MiniMax H3 Decode AV | Decodes the joint latent into IMAGE and AUDIO |
+| MiniMax H3 Unload All | Frees cached models, VAEs, and encoders |
+
+## Typical Workflows
+
+### T2VA / FL2VA
+
+```text
+SimplePrompt -> MiniMax H3 Conditioning -> MiniMax H3 KSampler
+                                         -> MiniMax H3 Decode AV -> output
+```
+
+Connect `MiniMax H3 FL Constraint` to `MiniMax H3 Conditioning` when using
+first-frame or last-frame constraints.
+
+### Ref2VA
+
+```text
+PackageData -> MiniMax H3 Conditioning -> MiniMax H3 KSampler
+              MiniMax H3 VAE Loader   -> MiniMax H3 Decode AV -> output
+```
+
+### Storyboard and Refiner
+
+```text
+Storyboard -> Refiner -> MiniMax H3 Conditioning -> MiniMax H3 KSampler
+            -> MiniMax H3 Decode AV -> output
+```
+
+Both Refiner nodes display the polished prompt in a built-in preview panel.
+Polling checks for ComfyUI cancellation between API requests.
+
+## Storyboard Subjects and Dialogue
+
+Global Subjects can be defined in the Storyboard subject column:
+
+```text
+Name: Alice
+Definition: a woman in the appearance of <Picture 1>.
+```
+
+The name can then be used directly in shot prompts. The backend converts
+subject names outside `<d>...</d>` into standard `<Subject N>` labels.
+Text inside `<d>...</d>` is protected and is not replaced.
+
+Speaker IDs are assigned in vocal order:
+
+```text
+[Shot 1] <Subject 2> (S1) says: <d>[English] Hi Bob.</d>
+[Shot 2] <Subject 1> (S2) says: <d>[English] Hello Alice.</d>
+[Shot 3] Alice (S1) says: <d>[English] Let's go.</d>
+```
+
+Refiner models, both official and third-party, normally write these IDs
+automatically. Manual labels are also accepted.
+
+## Music Field
+
+The Storyboard `music_style` field maps to `non_diegetic_music` in the prompt.
+It should describe background music that only the audience hears.
+
+Useful details:
+
+- Instrumentation, for example acoustic guitar or solo piano
+- Tempo and rhythm, for example slow, sparse, or steady
+- Dynamic development, for example low and continuous, or gradually fading
+
+Do not put dialogue, singing, or physical sound effects into this field.
+Leave it empty to output `N/A`.
+
+## Notes
+
+- `MiniMax H3 Conditioning.width/height` define the output latent resolution.
+- `MiniMax H3 FL Constraint` and `MiniMax H3 PackageData` cannot be used in the
+  same Conditioning node.
+- `MiniMax H3 KSampler.latent` is optional in the input schema only so the
+  `negative` socket can appear above it. A missing latent raises a clear error.
+- `MiniMax H3 AdaLN cache` can pre-bake AdaLN modulations before sampling.
+- `MiniMax H3 BlockSwap Args` is designed for low-VRAM use with a CPU home
+  pool and optional disk prefetch.
+
+## Tests
+
+The repository includes test scripts covering:
+
+- Ref2VA token and reference-structure alignment
+- H3 v2 VAE encode alignment
+- DiT and quantized forward equivalence
+- QuantizedTensor release
+- BlockSwap smoke tests
+- LoRA folding
+
+Run tests with the ComfyUI virtual environment Python from the package root.
+
+## Publishing to Comfy Registry
+
+1. Create a Comfy Registry publisher account.
+2. Add a GitHub repository secret named `REGISTRY_ACCESS_TOKEN` containing
+   the Comfy Registry publishing API key.
+3. Push to `main`. The workflow publishes automatically when
+   `pyproject.toml` changes.
+
+`tests/` is kept in git but excluded from the registry archive by
+`.comfyignore`.

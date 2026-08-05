@@ -1,0 +1,5 @@
+﻿torch>=2.1
+safetensors>=0.4
+numpy
+# optional (encoder reuse): transformers>=4.46 for AutoTokenizer/AutoProcessor
+# optional (Windows fast positioned reads): pywin32
