@@ -155,7 +155,7 @@ class EncoderStreamConfig:
 @dataclass(frozen=True)
 class AttentionConfig:
     """Attention backend selection (mirrors BerniniR_AttentionConfig)."""
-    backend: str = "auto"
+    backend: str = "sageattn2"
     force_backend: bool = False
     available: tuple = ()
     best: str = "sdpa_math"

@@ -25,6 +25,11 @@ logger = logging.getLogger("h3.attn")
 _PRIORITY = ["sageattn3", "sageattn2", "sageattn1", "flash_attention",
              "sdpa_flash", "xformers", "sdpa", "sdpa_math"]
 
+# SageAttention3's Blackwell TMA descriptor fails for very long sequences
+# (e.g. 71k tokens on this box). Keep Sage3 below the verified safe length
+# and let Sage2 handle longer prefill sequences.
+_SAGE3_MAX_SEQ = 65536
+
 _AVAILABLE: dict[str, bool] = {}
 
 # -- SageAttention 3 (Blackwell: 5090/5070 Ti/B200) --
@@ -111,6 +116,11 @@ def _xformers_core(q, k, v):
 
 
 def _sage3_core(q, k, v):
+    if q.shape[-2] > _SAGE3_MAX_SEQ or k.shape[-2] > _SAGE3_MAX_SEQ:
+        logger.warning(
+            "SageAttention3 does not support seq_len > %d; using SageAttention2 "
+            "for this attention call", _SAGE3_MAX_SEQ)
+        return _sage_core(q, k, v)
     from sageattn3 import sageattn3_blackwell
     return sageattn3_blackwell(q, k, v)
 

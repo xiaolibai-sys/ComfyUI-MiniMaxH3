@@ -1,7 +1,7 @@
 [project]
 # Registry node id. Rename before the first publish if this name is taken.
 name = "minimax-h3"
-version = "1.1.0"
+version = "1.1.1"
 description = "MiniMax H3 video and audio generation nodes for ComfyUI"
 requires-python = ">=3.10"
 dependencies = [

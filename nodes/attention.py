@@ -19,7 +19,7 @@ class MiniMaxH3AttentionConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "backend": (BACKEND_NAMES, {"default": "auto",
+                "backend": (BACKEND_NAMES, {"default": "sageattn2",
                     "tooltip": "Attention backend. auto selects the best available backend: "
                                "Sage3 -> Sage2/1 -> FlashAttn -> SDPA-flash(torch) -> xformers -> SDPA -> SDPA-math"}),
                 "force_backend": ("BOOLEAN", {"default": False,
@@ -32,7 +32,7 @@ class MiniMaxH3AttentionConfig:
     FUNCTION = "configure"
     CATEGORY = "MiniMax-H3/loaders"
 
-    def configure(self, backend="auto", force_backend=False):
+    def configure(self, backend="sageattn2", force_backend=False):
         cfg = AttentionConfig(
             backend=backend,
             force_backend=force_backend,

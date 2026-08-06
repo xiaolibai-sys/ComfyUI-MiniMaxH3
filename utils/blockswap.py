@@ -245,11 +245,16 @@ class _TransferEngine:
         self._home = home
 
         self._stream: Optional[torch.cuda.Stream] = None
+        self._d2h_stream: Optional[torch.cuda.Stream] = None
         if self.prefetch:
             try:
                 self._stream = torch.cuda.Stream(device=self.device)
             except Exception:
                 self._stream = None
+            try:
+                self._d2h_stream = torch.cuda.Stream(device=self.device)
+            except Exception:
+                self._d2h_stream = None
 
         nh = max(0, n_home_slots)
         ng = max(0, n_gpu_slots)
@@ -282,13 +287,17 @@ class _TransferEngine:
         self._cleanup_exec = ThreadPoolExecutor(
             max_workers=max(2, self.prefetch_count),
             thread_name_prefix="h3clean")
-        self._transfer_lock = threading.Lock()
+        self._transfer_lock = threading.RLock()
 
         self._gpu_cursor = 0
         self._block_home: dict[int, int] = {}
         self._block_gpu: dict[int, int] = {}
         # block_idx -> event recorded after its async H2D was enqueued
         self._events: dict[int, torch.cuda.Event] = {}
+        # gpu slot -> event recorded after its latest H2D was enqueued
+        self._gpu_h2d_events: dict[int, torch.cuda.Event] = {}
+        # gpu slot -> event recorded after its latest D2H was enqueued
+        self._gpu_d2h_events: dict[int, torch.cuda.Event] = {}
         # block_idx -> (slot id, ready event, future, block, mode)
         self._pin_stage: dict[int, tuple[int, threading.Event, Future, SwapBlock, str]] = {}
         # hslot -> event recorded after an async D2H into that home slot
@@ -443,59 +452,65 @@ class _TransferEngine:
     def load_block(self, block_idx: int, block: SwapBlock,
                    non_blocking: bool = True) -> None:
         """Copy *block*'s weights onto a GPU ring slot."""
-        if block_idx in self._block_gpu:
-            return
-        hslot = self.ensure_home(block_idx, block, non_blocking=False)
-        # The reload source is the home slot itself, so any in-flight async
-        # D2H into it must finish before we read it.
-        self._wait_home_slot(hslot)
-        self._home.wait_home_fill(hslot)
-        ridx = self._ring_acquire()
-        gpu = self._ensure_entries(self._gpu_pool, self._gpu_built,
-                                   ridx, block, self.device)
-        nb = self._stream is not None and non_blocking
+        with self._transfer_lock:
+            if block_idx in self._block_gpu:
+                return
+            hslot = self.ensure_home(block_idx, block, non_blocking=False)
+            # The reload source is the home slot itself, so any in-flight async
+            # D2H into it must finish before we read it.
+            self._wait_home_slot(hslot)
+            self._home.wait_home_fill(hslot)
+            ridx = self._ring_acquire()
+            gpu = self._ensure_entries(self._gpu_pool, self._gpu_built,
+                                       ridx, block, self.device)
+            prev_d2h = self._gpu_d2h_events.get(ridx)
+            if prev_d2h is not None:
+                if self._stream is not None:
+                    self._stream.wait_event(prev_d2h)
+                else:
+                    torch.cuda.current_stream().wait_event(prev_d2h)
+            nb = self._stream is not None and non_blocking
 
-        # The block's own home slot is the source of truth for a reload: the
-        # offload path binds params to the home slot before the async D2H
-        # copy finishes, so params can briefly alias stale slot data.  Reading
-        # the slot entries directly (after _wait_home_slot) always yields the
-        # block's own weights.
-        home_entries = self._home_pool[hslot]
-        src = {}
-        for n, (mod, leaf, kind) in zip(block.names, block.refs):
-            e = home_entries.get(n)
-            if e is not None:
-                src[n] = e
+            home_entries = self._home_pool[hslot]
+            src = {}
+            for n, (mod, leaf, kind) in zip(block.names, block.refs):
+                e = home_entries.get(n)
+                if e is not None:
+                    src[n] = e
 
-        if non_blocking and self._stream is not None and self.pin_memory:
-            # pinned staging path: params -> pinned CPU -> GPU on the stream.
-            # Reusing an H2D staging slot is only safe after its previous async
-            # H2D actually read it; otherwise a later fill could land before the
-            # earlier transfer stream drained it -> scrambled weights.
-            pidx = self._pin_acquire()
-            if pidx is not None:
-                prev = self._pin_events.pop(pidx, None)
-                if prev is not None:
-                    prev.synchronize()
-                pin = self._pin.ensure(pidx, gpu)
-                for n, e in src.items():
-                    pe = pin.get(n)
-                    if pe is not None:
-                        pe.copy_from(e)
-                self._stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._stream):
-                    for n in pin:
-                        pe, ge = pin[n], gpu.get(n)
+            if non_blocking and self._stream is not None and self.pin_memory:
+                pidx = self._pin_acquire()
+                if pidx is not None:
+                    prev = self._pin_events.pop(pidx, None)
+                    if prev is not None:
+                        prev.synchronize()
+                    pin = self._pin.ensure(pidx, gpu)
+                    for n, e in src.items():
+                        pe = pin.get(n)
+                        if pe is not None:
+                            pe.copy_from(e)
+                    self._stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self._stream):
+                        for n in pin:
+                            pe, ge = pin[n], gpu.get(n)
+                            if ge is None:
+                                continue
+                            ge.copy_from(pe, non_blocking=True)
+                    compute = torch.cuda.current_stream()
+                    ev = torch.cuda.Event()
+                    ev.record(self._stream)
+                    compute.wait_event(ev)
+                    self._gpu_h2d_events[ridx] = ev
+                    self._pin_events[pidx] = ev
+                    self._events[block_idx] = ev
+                    nb = False
+                else:
+                    for n, e in src.items():
+                        ge = gpu.get(n)
                         if ge is None:
                             continue
-                        ge.copy_from(pe, non_blocking=True)
-                compute = torch.cuda.current_stream()
-                ev = torch.cuda.Event()
-                ev.record(self._stream)
-                compute.wait_event(ev)
-                self._pin_events[pidx] = ev
-                self._events[block_idx] = ev
-                nb = False  # pin path already synced; skip outer event recording
+                        ge.copy_from(e, non_blocking=False)
+                    nb = False
             else:
                 for n, e in src.items():
                     ge = gpu.get(n)
@@ -503,25 +518,18 @@ class _TransferEngine:
                         continue
                     ge.copy_from(e, non_blocking=False)
                 nb = False
-        else:
-            for n, e in src.items():
-                ge = gpu.get(n)
-                if ge is None:
-                    continue
-                ge.copy_from(e, non_blocking=False)
-            nb = False
 
-        self._assign(block, gpu)
+            self._assign(block, gpu)
 
-        # recycle the home slot: the block's only copy now lives on the ring
-        hslot = self._block_home.pop(block_idx, None)
-        if hslot is not None:
-            self._release_home(hslot)
-        self._block_gpu[block_idx] = ridx
-        if nb:
-            ev = torch.cuda.Event()
-            ev.record(self._stream)
-            self._events[block_idx] = ev
+            hslot = self._block_home.pop(block_idx, None)
+            if hslot is not None:
+                self._release_home(hslot)
+            self._block_gpu[block_idx] = ridx
+            if nb:
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+                self._gpu_h2d_events[ridx] = ev
+                self._events[block_idx] = ev
 
     def offload_block(self, block_idx: int, block: SwapBlock,
                       force: bool = False) -> bool:
@@ -535,81 +543,90 @@ class _TransferEngine:
         block's slot - the victim's RAM copy is released and will be re-read
         from disk on its next use.
         """
-        event = self._events.pop(block_idx, None)
-        if event is not None:
-            torch.cuda.current_stream().wait_event(event)
-        gslot = self._block_gpu.pop(block_idx, None)
-        if gslot is None:
-            return False
-        hslot = self._block_home.get(block_idx)
-        if hslot is None:
-            try:
-                hslot = self._acquire_home()
-            except RuntimeError:
-                if not force:
-                    try:
-                        hslot = self._wait_home_free()
-                    except RuntimeError:
-                        self._block_gpu[block_idx] = gslot
-                        return False
-                else:
-                    victims = [idx for idx in self._block_home
-                               if idx not in self._pin_stage]
-                    if not victims:
-                        self._block_gpu[block_idx] = gslot
-                        return False
-                    victim = min(victims)
-                    hslot = self._block_home.pop(victim)
-                    self._wait_home_slot(hslot)
-                    self._home.wait_home_fill(hslot)
-                    self._home.release(victim)
-        self._wait_home_slot(hslot)
-        self._home.wait_home_fill(hslot)
-        gpu = self._gpu_pool[gslot]
-        home = self._ensure_entries(self._home_pool, self._home_built,
-                                    hslot, block, "cpu")
-
-        if self._use_host_register_d2h:
-            try:
-                tokens = _register_cpu_entries(home)
-            except Exception as e:
-                self._use_host_register_d2h = False
-                logger.error("blockswap: cudaHostRegister for D2H failed for %s: %s",
-                             block.name, e)
-                tokens = None
-            if tokens is not None:
-                self._home_registered[hslot] = tokens
-                self._stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._stream):
-                    for n in list(gpu.keys() & home.keys()):
-                        home[n].copy_from(gpu[n], non_blocking=True)
-                ev = torch.cuda.Event()
-                ev.record(self._stream)
-                ready = threading.Event()
-                self._d2h_events[hslot] = ev
-                self._home_ready[hslot] = ready
-                self._block_home[block_idx] = hslot
-                with self._d2h_cleanup_lock:
-                    self._d2h_cleanup_pending.add(ready)
+        with self._transfer_lock:
+            event = self._events.pop(block_idx, None)
+            if event is not None:
+                torch.cuda.current_stream().wait_event(event)
+            gslot = self._block_gpu.pop(block_idx, None)
+            if gslot is None:
+                return False
+            hslot = self._block_home.get(block_idx)
+            if hslot is None:
                 try:
-                    self._cleanup_exec.submit(
-                        self._unregister_home_after_d2h,
-                        hslot, ev, tokens, ready)
-                except Exception:
-                    ev.synchronize()
-                    _unregister_cpu_entries(tokens)
-                    self._home_registered.pop(hslot, None)
-                    ready.set()
-                    with self._d2h_cleanup_lock:
-                        self._d2h_cleanup_pending.discard(ready)
-                return True
+                    hslot = self._acquire_home()
+                except RuntimeError:
+                    if not force:
+                        try:
+                            hslot = self._wait_home_free()
+                        except RuntimeError:
+                            self._block_gpu[block_idx] = gslot
+                            return False
+                    else:
+                        victims = [idx for idx in self._block_home
+                                   if idx not in self._pin_stage]
+                        if not victims:
+                            self._block_gpu[block_idx] = gslot
+                            return False
+                        victim = min(victims)
+                        hslot = self._block_home.pop(victim)
+                        self._wait_home_slot(hslot)
+                        self._home.wait_home_fill(hslot)
+                        self._home.release(victim)
+            self._wait_home_slot(hslot)
+            self._home.wait_home_fill(hslot)
+            gpu = self._gpu_pool[gslot]
+            home = self._ensure_entries(self._home_pool, self._home_built,
+                                        hslot, block, "cpu")
 
-        # Synchronous fallback when host registration is unavailable.
-        for n in list(gpu.keys() & home.keys()):
-            home[n].copy_from(gpu[n])
-        self._assign(block, home)
-        self._block_home[block_idx] = hslot
-        return True
+            prev_h2d = self._gpu_h2d_events.get(gslot)
+            if self._use_host_register_d2h and self._d2h_stream is not None:
+                try:
+                    tokens = _register_cpu_entries(home)
+                except Exception as e:
+                    self._use_host_register_d2h = False
+                    logger.error(
+                        "blockswap: cudaHostRegister for D2H failed for %s: %s",
+                        block.name, e)
+                    tokens = None
+                if tokens is not None:
+                    self._home_registered[hslot] = tokens
+                    if prev_h2d is not None:
+                        self._d2h_stream.wait_event(prev_h2d)
+                    self._d2h_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self._d2h_stream):
+                        for n in list(gpu.keys() & home.keys()):
+                            home[n].copy_from(gpu[n], non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record(self._d2h_stream)
+                    self._gpu_d2h_events[gslot] = ev
+                    ready = threading.Event()
+                    self._d2h_events[hslot] = ev
+                    self._home_ready[hslot] = ready
+                    self._block_home[block_idx] = hslot
+                    with self._d2h_cleanup_lock:
+                        self._d2h_cleanup_pending.add(ready)
+                    try:
+                        self._cleanup_exec.submit(
+                            self._unregister_home_after_d2h,
+                            hslot, ev, tokens, ready)
+                    except Exception:
+                        ev.synchronize()
+                        _unregister_cpu_entries(tokens)
+                        self._home_registered.pop(hslot, None)
+                        ready.set()
+                        with self._d2h_cleanup_lock:
+                            self._d2h_cleanup_pending.discard(ready)
+                    return True
+
+            # Synchronous fallback when host registration is unavailable.
+            if prev_h2d is not None:
+                torch.cuda.current_stream().wait_event(prev_h2d)
+            for n in list(gpu.keys() & home.keys()):
+                home[n].copy_from(gpu[n])
+            self._gpu_d2h_events.pop(gslot, None)
+            self._assign(block, home)
+            self._block_home[block_idx] = hslot
+            return True
 
     def _unregister_home_after_d2h(self, hslot: int, ev: torch.cuda.Event,
                                    tokens: list[tuple[int, int]],
@@ -777,6 +794,9 @@ class _TransferEngine:
                 ridx = self._ring_acquire()
                 gpu = self._ensure_entries(self._gpu_pool, self._gpu_built,
                                            ridx, block, self.device)
+                prev_d2h = self._gpu_d2h_events.get(ridx)
+                if prev_d2h is not None:
+                    self._stream.wait_event(prev_d2h)
                 self._stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._stream):
                     for n, e in home.items():
@@ -788,6 +808,7 @@ class _TransferEngine:
                 ev = torch.cuda.Event()
                 ev.record(self._stream)
                 compute.wait_event(ev)
+                self._gpu_h2d_events[ridx] = ev
                 release_ready = threading.Event()
                 with self._home_free_cond:
                     self._home_h2d_release.add(release_ready)
@@ -815,6 +836,9 @@ class _TransferEngine:
                 ridx = self._ring_acquire()
                 gpu = self._ensure_entries(self._gpu_pool, self._gpu_built,
                                            ridx, block, self.device)
+                prev_d2h = self._gpu_d2h_events.get(ridx)
+                if prev_d2h is not None:
+                    self._stream.wait_event(prev_d2h)
                 pin = self._pin.slots[pidx]
                 if pin is None:
                     raise RuntimeError("blockswap: missing pin stage")
@@ -829,6 +853,7 @@ class _TransferEngine:
                 ev = torch.cuda.Event()
                 ev.record(self._stream)
                 compute.wait_event(ev)
+                self._gpu_h2d_events[ridx] = ev
                 self._pin_events[pidx] = ev
                 self._events[block_idx] = ev
                 self._assign(block, gpu)
@@ -850,11 +875,15 @@ class _TransferEngine:
         return self._complete_h2d(block_idx, wait_ready=True)
 
     def cancel_all(self) -> None:
-        if not self._events:
+        if not self._events and not self._gpu_h2d_events and not self._gpu_d2h_events:
             return
         if self._stream is not None:
             self._stream.synchronize()
+        if self._d2h_stream is not None:
+            self._d2h_stream.synchronize()
         self._events.clear()
+        self._gpu_h2d_events.clear()
+        self._gpu_d2h_events.clear()
 
     def sync_all(self) -> None:
         if not torch.cuda.is_available():
@@ -902,6 +931,8 @@ class _TransferEngine:
         self._block_home.clear()
         self._block_gpu.clear()
         self._events.clear()
+        self._gpu_h2d_events.clear()
+        self._gpu_d2h_events.clear()
         self._d2h_events.clear()
 
 
@@ -1237,6 +1268,22 @@ class BlockSwapManager:
             self._xfer.flush_prefetch()
             self.prefetch_next(block_idx)
 
+    def after_compute(self, block_idx: int) -> None:
+        """Enqueue D2H immediately after a non-hot block's forward returns.
+
+        The D2H transfer stream waits on the current compute stream, so the
+        copy runs after this block's kernels and can overlap the next block's
+        compute.  Blocks kept in the hot set stay on GPU.
+        """
+        if block_idx in self._window.hot:
+            return
+        if block_idx not in self._window.on_gpu:
+            return
+        if self._xfer._block_gpu.get(block_idx) is None:
+            return
+        if self._xfer.offload_block(block_idx, self.blocks[block_idx]):
+            self._window.mark_offloaded(block_idx)
+
     def prefetch_next(self, block_idx: int) -> None:
         """Prefetch blocks just beyond the window.
 
@@ -1262,6 +1309,8 @@ class BlockSwapManager:
     def end(self) -> None:
         if self._xfer._stream is not None:
             self._xfer._stream.synchronize()
+        if self._xfer._d2h_stream is not None:
+            self._xfer._d2h_stream.synchronize()
         self._xfer.wait_d2h_cleanup()
 
     def shutdown(self) -> None:

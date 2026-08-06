@@ -774,6 +774,7 @@ class MiniMaxH3Model(nn.Module):
                 )
                 h = block(h, t_emb, mod_segments, rope_freqs,
                           precomputed=block_mods)
+                swap.after_compute(i)
             swap.end()
         else:
             for i, block in enumerate(self.blocks):
