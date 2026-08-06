@@ -86,6 +86,7 @@ class H3BlockSwap:
     """
     enabled: bool = True
     block_to_swap: int = 47             # DiT blocks off GPU (50 - 47 = 3 resident)
+    hot_blocks: int = 0                 # leading DiT blocks kept resident on GPU
     prefetch: bool = True               # disk -> RAM prefetch of the next window
     prefetch_count: int = 2             # home slots read ahead from disk
     pin_memory: bool = True             # pinned CPU staging; only the small prefetch/stage pools are pinned (home stays pageable), so the locked footprint is tiny and Windows-safe
