@@ -17,7 +17,7 @@ Mirrors ``ComfyUI-BerniniRWrapper/utils/block_swap.py`` (lazy disk mode):
 * ``BlockSwapManager`` - sliding window: load-first so the incoming block
   frees its home slot before the outgoing one needs it, transfer-stream
   prefetch of the next window, LoRA folded on the GPU ring right after the
-  block lands (``block.lora`` payload consumed to ``[]`` marks "folded").
+  block lands (``block.lora`` consumed to ``None`` marks "folded").
 
 Public API (``begin/prepare/end/shutdown/stats`` + ``apply_lora/clear_lora``)
 is unchanged, so ``models/model.py`` and ``utils/lifecycle.py`` keep working.
@@ -53,7 +53,8 @@ class SwapBlock:
     names: list[str] = field(default_factory=list)           # relative param names
     refs: list[tuple[torch.nn.Module, str, str]] = field(default_factory=list)
     templates: list[SlotEntry] = field(default_factory=list)  # slot templates
-    lora: list = field(default_factory=list)                  # pending LoRA payload
+    lora: Optional[list] = None                                # pending LoRA payload
+    overrides: dict = field(default_factory=dict)              # full weight overrides
 
     def bytes_per_block(self) -> int:
         total = 0
@@ -1054,6 +1055,8 @@ class _DiskPrefetcher:
             t = tensors.get(full)
             if t is None:
                 continue
+            if n in block.overrides:
+                t = block.overrides[n]
             e = slot[n]
             if e is None:
                 continue
@@ -1209,7 +1212,7 @@ class BlockSwapManager:
         self.blocks[block_idx].lora = list(entries)
 
     def clear_lora(self, block_idx: int) -> None:
-        self.blocks[block_idx].lora = []
+        self.blocks[block_idx].lora = None
 
     def begin(self) -> None:
         self._xfer.cancel_all()
@@ -1356,7 +1359,7 @@ class BlockSwapManager:
     def _fold_lora_on_gpu(self, block_idx: int) -> None:
         """Fold *block_idx*'s pending LoRA payload into its GPU ring slot.
 
-        The payload (``block.lora``) is consumed to ``[]`` afterwards, so
+        The payload (``block.lora``) is consumed to ``None`` afterwards, so
         "folded or not" is inferred from the payload itself and re-loads
         (whose slots already hold merged weights) skip folding automatically.
         """
@@ -1367,4 +1370,4 @@ class BlockSwapManager:
         if gslot is None:
             return
         fold_lora_into_slot(block, self._xfer._gpu_pool[gslot])
-        block.lora = []
+        block.lora = None

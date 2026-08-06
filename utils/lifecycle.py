@@ -28,7 +28,7 @@ import torch
 from .config import MiniMaxH3DiTConfig
 from .stream import BlockReader
 from .blockswap import BlockSwapManager, SwapBlock, free_module_storage
-from .types import H3BlockSwap
+from .types import H3BlockSwap, H3LoraSet, SlotEntry
 from ..models import quant
 
 _MAX_MODEL_CACHE = 1
@@ -139,7 +139,8 @@ def _is_swappable(pname: str) -> bool:
     return pname.startswith("blocks.") or pname.startswith("token_refiner.blocks.")
 
 
-def _bind_periphery(module, reader, prefix, device, dtype):
+def _bind_periphery(module, reader, prefix, device, dtype,
+                    adaln_override=None):
     """Bind every non-swappable parameter/buffer from the checkpoint."""
     from ..models.quant import bind_param
     sd = reader.get_tensors([
@@ -173,9 +174,23 @@ def _bind_periphery(module, reader, prefix, device, dtype):
             leaf = bname.rsplit(".", 1)[1] if "." in bname else bname
             mod._buffers[leaf] = sd[key].to(device, b.dtype if b.dtype != torch.float32 else b.dtype)
 
+    if adaln_override is not None:
+        table = adaln_override.table
+        module.adaln_t_table.copy_(table.to(device, module.adaln_t_table.dtype))
+        final = module.final_layer.adaln_proj.linear
+        if adaln_override.final_weight is not None:
+            final.weight = torch.nn.Parameter(
+                adaln_override.final_weight.to(device, final.weight.dtype),
+                requires_grad=False)
+        if adaln_override.final_bias is not None:
+            final.bias = torch.nn.Parameter(
+                adaln_override.final_bias.to(device, final.bias.dtype),
+                requires_grad=False)
+
 
 def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
-              swap: H3BlockSwap, include_adaln: bool = True
+              swap: H3BlockSwap, include_adaln: bool = True,
+              adaln_override=None
               ) -> tuple["MiniMaxH3Model", BlockSwapManager, str]:
     from ..models.model import MiniMaxH3Model
     config = scan_dit_config(reader, MiniMaxH3DiTConfig())
@@ -187,13 +202,14 @@ def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
     model._key_prefix = prefix
     device = torch.device(device)
 
-    _bind_periphery(model, reader, prefix, device, dtype)
+    _bind_periphery(model, reader, prefix, device, dtype, adaln_override)
 
     # ---- block plan (metadata-only; weights stream later) ------------------
     blocks: list[SwapBlock] = []
     for i in range(config.num_layers):
         blk = model.blocks[i]
         keys, names, refs, templates = [], [], [], []
+        overrides = {}
         for pname, p in blk.named_parameters():
             key = f"{prefix}blocks.{i}.{pname}"
             keys.append(key)
@@ -201,17 +217,32 @@ def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
             mod = blk.get_submodule(pname.rsplit(".", 1)[0]) if "." in pname else blk
             leaf = pname.rsplit(".", 1)[1] if "." in pname else pname
             refs.append((mod, leaf, "param"))
-            spec = quant.load_layer_spec(reader, key, read_weight=False)
-            # use the MODULE param dtype (curve-form adaln is fp32 while the
-            # rest of the block is bf16) so the bound weight matches forward()
-            templates.append(quant.slot_entry_template(spec, tuple(p.shape), p.dtype))
-            if spec.is_quant and isinstance(mod, torch.nn.Linear):
-                # swap blocks are bound from slot entries (not bind_param), so
-                # the quant dispatch patch + per-layer extras must be attached
-                # once here, at plan time.
-                quant.patch_linear(mod)
-                for ename, et in spec.extra_params.items():
-                    setattr(mod, f"_{ename}", et.to(device))
+            if (adaln_override is not None and
+                    pname in ("adaln_proj.linear.weight", "adaln_proj.linear.bias")):
+                leaf_name = pname.split(".")[-1]
+                src = (adaln_override.block_weights.get(i)
+                       if leaf_name == "weight"
+                       else adaln_override.block_biases.get(i))
+                if src is not None:
+                    tpl = SlotEntry(data=src.to(p.dtype))
+                    overrides[pname] = tpl.data
+                else:
+                    spec = quant.load_layer_spec(reader, key, read_weight=False)
+                    tpl = quant.slot_entry_template(
+                        spec, tuple(p.shape), p.dtype)
+            else:
+                spec = quant.load_layer_spec(reader, key, read_weight=False)
+                # use the MODULE param dtype (curve-form adaln is fp32 while the
+                # rest of the block is bf16) so the bound weight matches forward()
+                tpl = quant.slot_entry_template(spec, tuple(p.shape), p.dtype)
+                if spec.is_quant and isinstance(mod, torch.nn.Linear):
+                    # swap blocks are bound from slot entries (not bind_param), so
+                    # the quant dispatch patch + per-layer extras must be attached
+                    # once here, at plan time.
+                    quant.patch_linear(mod)
+                    for ename, et in spec.extra_params.items():
+                        setattr(mod, f"_{ename}", et.to(device))
+            templates.append(tpl)
         for bname, b in blk.named_buffers():
             key = f"{prefix}blocks.{i}.{bname}"
             keys.append(key)
@@ -222,7 +253,8 @@ def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
             spec = quant.load_layer_spec(reader, key, read_weight=False)
             templates.append(quant.slot_entry_template(spec, tuple(b.shape), b.dtype))
         blocks.append(SwapBlock(name=f"blocks.{i}", module=blk, keys=keys, names=names,
-                                refs=refs, templates=templates))
+                                refs=refs, templates=templates,
+                                overrides=overrides))
 
     mgr = BlockSwapManager(
         blocks, reader, device,
@@ -268,6 +300,10 @@ def run_token_refiner(model: MiniMaxH3Model, reader: BlockReader, text_states: t
                 bind_param(mod, leaf, qt, spec.extra_params)
             else:
                 mod._parameters[leaf] = torch.nn.Parameter(t.to(device, dtype), requires_grad=False)
+        lora_entries = getattr(model, "_lora_token_refiner_groups", {}).get(i, [])
+        if lora_entries:
+            from ..models.lora import fold_lora_into_module
+            fold_lora_into_module(blk, lora_entries)
         x = blk(x)
         for mod, leaf in refs:
             mod._parameters[leaf] = torch.nn.Parameter(torch.empty((0,), dtype=dtype), requires_grad=False)
@@ -283,12 +319,15 @@ def run_token_refiner(model: MiniMaxH3Model, reader: BlockReader, text_states: t
 # ---------------------------------------------------------------------------
 
 def _cache_key(path: str, swap: H3BlockSwap, attn_backend=None,
-               include_adaln: bool = True) -> str:
+               include_adaln: bool = True,
+               loras: Optional[H3LoraSet] = None) -> str:
+    lora_sig = loras.signature() if loras else None
     raw = json.dumps(dict(path=path, block_to_swap=swap.block_to_swap, prefetch=swap.prefetch,
                           prefetch_count=swap.prefetch_count, pin=swap.pin_memory,
                           hot_blocks=swap.hot_blocks, workers=swap.disk_workers,
                           dtype=swap.dtype, enabled=swap.enabled,
                           include_adaln=include_adaln,
+                          lora=lora_sig,
                           attn=getattr(attn_backend, "backend", "auto") if attn_backend is not None else "auto"),
                      sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -326,6 +365,7 @@ class ModelHandle:
         self.dtype = self.swap.torch_dtype
         self.include_adaln = True
         self.attn_backend = attn_backend
+        self.loras: H3LoraSet = H3LoraSet()
         self._model: Optional[MiniMaxH3Model] = None
         self._swap_mgr: Optional[BlockSwapManager] = None
         self._reader: Optional[BlockReader] = None
@@ -338,7 +378,7 @@ class ModelHandle:
 
     def _cache_key(self) -> str:
         return _cache_key(self.model_path, self.swap, self.attn_backend,
-                          self.include_adaln)
+                          self.include_adaln, self.loras)
 
     def _cache_evict_self(self) -> None:
         with _cache_lock:
@@ -391,7 +431,8 @@ class ModelHandle:
         if self.swap.enabled and device.type == "cuda":
             model, mgr, _ = build_dit(
                 self._reader, self.dtype, device, self.swap,
-                include_adaln=include_adaln)
+                include_adaln=include_adaln,
+                adaln_override=self.loras.adaln_override if self.loras else None)
             if self.attn_backend is not None:
                 model.set_attn_backend(self.attn_backend)
             self._model, self._swap_mgr = model, mgr
@@ -401,10 +442,14 @@ class ModelHandle:
             with torch.device("meta"):
                 model = MiniMaxH3Model(cfg, dtype=self.dtype,
                                        include_adaln=include_adaln)
-            _bind_periphery(model, self._reader, detect_key_prefix(self._reader), device, self.dtype)
+            _bind_periphery(
+                model, self._reader, detect_key_prefix(self._reader),
+                device, self.dtype,
+                adaln_override=self.loras.adaln_override if self.loras else None)
             model.to(device)
             model._config = cfg
             self._model = model
+        self._apply_lora(self._model, self._swap_mgr)
         self._cache_put()
         return self._model
 
@@ -417,6 +462,60 @@ class ModelHandle:
         assert self._reader is not None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return run_token_refiner(model, self._reader, text_states, device, self.dtype)
+
+    def _apply_lora(self, model, mgr) -> None:
+        loras = self.loras
+        if not loras:
+            return
+        if mgr is None:
+            raise ValueError(
+                "MiniMax H3 LoRA loader currently requires BlockSwap enabled."
+            )
+        model._lora_token_refiner_groups = loras.token_refiner_groups
+        use_curves = bool(getattr(model, "use_adaln_curves", False))
+        if loras.adaln_override is not None and not use_curves:
+            raise ValueError(
+                "complete AdaLN table override requires a pruned/curve model"
+            )
+        block_groups = {
+            i: list(entries) for i, entries in loras.block_groups.items()
+        }
+        runtime_adaln: dict[int, list] = {}
+
+        if use_curves:
+            for i, entries in list(block_groups.items()):
+                folded = [e for e in entries if e.target != "adaln_proj.linear"]
+                adaln = [e for e in entries if e.target == "adaln_proj.linear"]
+                if adaln:
+                    runtime_adaln[i] = adaln
+                if folded:
+                    block_groups[i] = folded
+                else:
+                    block_groups.pop(i, None)
+
+        from ..models.lora import fold_lora_into_module
+        for i, entries in block_groups.items():
+            mgr.apply_lora(i, entries)
+
+        runtime_final: list = []
+        if loras.final_adaln_entries:
+            if use_curves:
+                runtime_final = loras.final_adaln_entries
+            else:
+                fold_lora_into_module(model.final_layer, loras.final_adaln_entries)
+
+        if use_curves and (runtime_adaln or runtime_final):
+            from ..models.lora import (
+                AdalnLoraState,
+                attach_adaln_lora,
+                load_silu_grid,
+            )
+            state = AdalnLoraState(
+                load_silu_grid(loras.silu_grid_path),
+                runtime_adaln,
+                runtime_final,
+            )
+            attach_adaln_lora(model, state)
 
     def unload(self) -> None:
         self._cache_evict_self()

@@ -6,7 +6,7 @@ import torch
 
 
 class MiniMaxH3KSampler:
-    """Official k-diffusion sampler (comfy.samplers) over the packed H3 AV latent.
+    """Native MiniMax-H3 dual-schedule sampler over the packed AV latent.
 
     Optional config sockets follow the BerniniRWrapper pattern: TeaCache and
     BlockSwap are frozen dataclass payloads built by their own args nodes and
@@ -15,7 +15,6 @@ class MiniMaxH3KSampler:
 
     @classmethod
     def INPUT_TYPES(cls):
-        import comfy.samplers
         return {
             "required": {
                 "model": ("MINIMAX_H3_MODEL",),
@@ -25,8 +24,8 @@ class MiniMaxH3KSampler:
                 "cfg": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0, "step": 0.1,
                     "tooltip": "Classifier-free guidance scale. 1.0 disables negative guidance; "
                                "values above 1.0 require a negative conditioning input."}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
                 "shift_video": ("FLOAT", {"default": 12.0, "min": 1.0, "max": 100.0}),
+                "shift_audio": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 100.0}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "use_adaln_cache": ("BOOLEAN", {
                     "default": False,
@@ -45,9 +44,9 @@ class MiniMaxH3KSampler:
     FUNCTION = "sample"
     CATEGORY = "MiniMax-H3/sampling"
 
-    def sample(self, model, positive, seed, steps, cfg, sampler_name,
-               shift_video, denoise, use_adaln_cache, negative=None,
-               latent=None,
+    def sample(self, model, positive, seed, steps, cfg,
+               shift_video, shift_audio, denoise, use_adaln_cache,
+               negative=None, latent=None,
                teacache_args=None, block_swap_args=None):
         import comfy.utils
         import latent_preview
@@ -64,11 +63,17 @@ class MiniMaxH3KSampler:
                                            teacache_args=teacache_args)
         callback = latent_preview.prepare_callback(model, steps)
 
-        result = h3_sample(model, positive, latent, negative, steps, cfg,
-                           sampler_name, shift_video, denoise, seed, injection,
-                           preview_callback=callback,
-                           disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-                           use_adaln_cache=use_adaln_cache)
+        result = h3_sample(
+            model, positive, latent, negative, steps, cfg,
+            sampler_name="euler",
+            shift_video=shift_video,
+            shift_audio=shift_audio,
+            denoise=denoise,
+            seed=seed,
+            injection=injection,
+            preview_callback=callback,
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+            use_adaln_cache=use_adaln_cache)
 
         stats = (f"steps={result.steps} swap_hits={result.swap_hits} "
                  f"swap_loads={result.swap_loads} peak_vram={result.peak_vram_mb:.0f}MiB")

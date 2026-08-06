@@ -3,6 +3,7 @@
 from .types import (
     LoadingMode, SwapMode, CondKind, H3BlockSwap, H3TeaCache, EncoderStreamConfig,
     AttentionConfig, H3Conditioning, AVLatent, H3SampleResult, LoraEntry,
+    H3Lora, H3LoraSet, AdaLNOverride,
     SlotEntry, _params_extra_fields,
 )
 from .config import MiniMaxH3DiTConfig
@@ -19,7 +20,8 @@ from . import encoder_use
 __all__ = [
     "LoadingMode", "SwapMode", "CondKind", "H3BlockSwap", "H3TeaCache",
     "EncoderStreamConfig", "AttentionConfig", "H3Conditioning", "AVLatent",
-    "H3SampleResult", "LoraEntry", "SlotEntry", "_params_extra_fields",
+    "H3SampleResult", "LoraEntry", "H3Lora", "H3LoraSet", "SlotEntry",
+    "AdaLNOverride", "_params_extra_fields",
     "MiniMaxH3DiTConfig", "BlockReader", "BlockSwapManager", "SwapBlock",
     "ModelHandle", "load_model_handle", "unload_all", "collect_garbage",
     "free_module_storage", "InjectionContext", "TeaCache", "encoder_use",

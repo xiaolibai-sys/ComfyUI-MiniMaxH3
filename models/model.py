@@ -286,9 +286,27 @@ class AdalnProj(nn.Module):
         self.hidden = hidden
         self.apply_silu = apply_silu
         self.linear = nn.Linear(t_dim, expand * hidden * modalities, bias=True, dtype=dtype)
+        self._lora_state = None
+        self._lora_entries = None
+
+    def attach_lora(self, state, entries):
+        self._lora_state = state
+        self._lora_entries = list(entries)
 
     def forward(self, t_emb):
         x = self.linear(F.silu(t_emb) if self.apply_silu else t_emb)
+        state = self._lora_state
+        entries = self._lora_entries or []
+        st = state.current if state is not None else None
+        if state is not None and entries and st is not None:
+            delta = None
+            for entry in entries:
+                d = state.entry_delta(entry, st)
+                if d is None:
+                    continue
+                delta = d if delta is None else delta + d
+            if delta is not None:
+                x = x + delta.to(device=x.device, dtype=x.dtype)
         x = x.view(x.shape[0] * self.modalities, self.expand * self.hidden)
         return x.chunk(self.expand, dim=-1)
 
@@ -521,6 +539,7 @@ class MiniMaxH3Model(nn.Module):
         self.use_adaln_curves = config.adaln_curve_grid is not None
         self.include_adaln = include_adaln
         self.adaln_cache = None
+        self._lora_adaln = None
 
         curve = {"apply_silu": not self.use_adaln_curves,
                  "adaln_dtype": torch.float32 if self.use_adaln_curves else dtype}
@@ -599,7 +618,19 @@ class MiniMaxH3Model(nn.Module):
                 f"MiniMax H3 AdaLN cache missing signature {key}; "
                 "re-bake with the current sampler/payload."
             )
-        return entry.block_mods, entry.final_mods
+        if self._lora_adaln is None or self._lora_adaln.current is None:
+            return entry.block_mods, entry.final_mods
+        st = self._lora_adaln.current
+        block_mods = tuple(
+            self._lora_adaln.apply_to_mods(
+                entry.block_mods[i],
+                self._lora_adaln.block_entries.get(i),
+                st)
+            for i in range(len(entry.block_mods))
+        )
+        final_mods = self._lora_adaln.apply_to_mods(
+            entry.final_mods, self._lora_adaln.final_entries, st)
+        return block_mods, final_mods
 
     # -- text preprocessing ---------------------------------------------------
 
@@ -648,7 +679,8 @@ class MiniMaxH3Model(nn.Module):
 
     # -- forward ----------------------------------------------------------------
 
-    def velocity(self, video_x, audio_x, sigma, text_states, payload=None):
+    def velocity(self, video_x, audio_x, sigma, text_states, payload=None,
+                 shift_video=None, shift_audio=None):
         """One denoising step: returns (v_video, v_audio) flow velocities.
 
         ``sigma`` is the *video* sigma in [0,1] (float or 0-d tensor); the
@@ -678,8 +710,8 @@ class MiniMaxH3Model(nn.Module):
             payload = dict(payload)
             payload["layout"] = layout
 
-        shift_v = float(self.sigma_shift_video)
-        shift_a = float(self.sigma_shift_audio)
+        shift_v = float(self.sigma_shift_video if shift_video is None else shift_video)
+        shift_a = float(self.sigma_shift_audio if shift_audio is None else shift_audio)
         if isinstance(sigma, torch.Tensor):
             sigma_v = float(sigma.flatten()[0])
         else:
@@ -751,6 +783,9 @@ class MiniMaxH3Model(nn.Module):
             t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))
         else:
             t_emb = self.time_embedder(t_vals).to(dtype)
+
+        if self._lora_adaln is not None:
+            self._lora_adaln.set_current(unique_t, device, dtype)
 
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
         if not self.include_adaln and self.adaln_cache is None:

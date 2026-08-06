@@ -23,11 +23,12 @@ DiT block so they can be handed to ``BlockSwapManager.apply_lora``.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 
-from ..utils.types import LoraEntry, SlotEntry
+from ..utils.types import AdaLNOverride, H3Lora, LoraEntry, SlotEntry
 
 logger = logging.getLogger("h3.lora")
 
@@ -140,25 +141,72 @@ def _lora_delta(A: torch.Tensor, B: torch.Tensor, alpha, strength: float,
     return delta * (strength * (alpha_val / rank)), rank
 
 
-def _fold_entries(w: torch.Tensor, entries: list) -> torch.Tensor:
-    """LoRA + DoRA standardisation on one weight tensor (fp32)."""
-    w = w.float()
-    init_norm = None
-    has_dora = any(e.diff_b is not None for e in entries)
-    if has_dora and w.dim() == 2:
-        init_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+def _chunk_add_delta(w: torch.Tensor, entry, chunk_rows: int = 8192) -> None:
+    """Add one LoRA delta in row chunks on w.device."""
+    if entry.a is None or entry.b is None:
+        return
+    A = entry.a.to(device=w.device, dtype=torch.float32)
+    n_rows = w.shape[0]
+    for start in range(0, n_rows, chunk_rows):
+        end = min(start + chunk_rows, n_rows)
+        rows = slice(start, end)
+        B = entry.b[rows].to(device=w.device, dtype=torch.float32)
+        d, _ = _lora_delta(A, B, entry.alpha, entry.strength,
+                           (end - start, w.shape[1]))
+        w[rows] += d
+
+
+def _fold_entries_chunked(w: torch.Tensor, entries: list,
+                          chunk_rows: int = 8192) -> torch.Tensor:
+    """Chunked standard LoRA fold to avoid materialising huge B@A deltas."""
     for e in entries:
-        if e.a is None or e.b is None:
-            continue
-        d, _ = _lora_delta(e.a, e.b, e.alpha, e.strength, w.shape)
-        w = w + d
-    diff_b = next((e.diff_b for e in entries if e.diff_b is not None), None)
+        _chunk_add_delta(w, e, chunk_rows)
+    return w
+
+
+def _fold_entries_dora_chunked(w: torch.Tensor, entries: list,
+                               chunk_rows: int = 8192) -> torch.Tensor:
+    """Chunked DoRA fold: row norms on GPU, deltas added per row chunk."""
+    for e in entries:
+        if e.diff_b is not None:
+            before_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            _chunk_add_delta(w, e, chunk_rows)
+            after_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            diff_b = e.diff_b.to(device=w.device, dtype=w.dtype)
+            m = (before_norm + diff_b.float().reshape(-1, 1)).clamp(min=0.0)
+            w = m * w / after_norm
+        else:
+            _chunk_add_delta(w, e, chunk_rows)
+    return w
+
+
+def _fold_entries(w: torch.Tensor, entries: list) -> torch.Tensor:
+    """LoRA + DoRA standardisation on one weight tensor (fp32).
+
+    Multiple DoRA entries are applied sequentially in list order. Each DoRA
+    step renormalises against the current weight before adding its LoRA delta,
+    which keeps multiple adapters well-defined.
+    """
+    w = w.float()
+    if w.dim() == 2:
+        if any(e.diff_b is not None for e in entries):
+            return _fold_entries_dora_chunked(w, entries)
+        if not any(e.diff is not None for e in entries):
+            return _fold_entries_chunked(w, entries)
+    for e in entries:
+        before_norm = None
+        if e.diff_b is not None and w.dim() == 2:
+            before_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        if e.a is not None and e.b is not None:
+            d, _ = _lora_delta(e.a, e.b, e.alpha, e.strength, w.shape)
+            w = w + d.to(device=w.device, dtype=w.dtype)
+        if before_norm is not None:
+            diff_b = e.diff_b.to(device=w.device, dtype=w.dtype)
+            m = (before_norm + diff_b.float().reshape(-1, 1)).clamp(min=0.0)
+            w = m * w / w.norm(dim=1, keepdim=True).clamp(min=1e-8)
     diff = next((e.diff for e in entries if e.diff is not None), None)
-    if diff_b is not None and w.dim() == 2 and init_norm is not None:
-        m = (init_norm + diff_b.float().reshape(-1, 1)).clamp(min=0.0)
-        w = m * w / w.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    elif diff is not None and w.dim() == 1:
-        w = w + diff.float()
+    if diff is not None and w.dim() == 1:
+        w = w + diff.to(device=w.device, dtype=w.dtype).float()
     return w
 
 
@@ -263,19 +311,8 @@ def fold_lora_into_slot(block, slot: dict) -> None:
             entry.data.copy_(w.to(entry.data.dtype))
 
 
-# ---------------------------------------------------------------------------
-# LoRA file parsing -> BlockSwapManager.apply_lora payload
-# ---------------------------------------------------------------------------
-
-def parse_lora(lora_path: str, strength: float = 1.0,
-               block_prefix: str = "blocks."):
-    """Load + standardise a LoRA file and group entries per DiT block index.
-
-    Returns ``{block_idx: [LoraEntry, ...]}`` ready for
-    ``BlockSwapManager.apply_lora(idx, entries)``.
-    """
-    from safetensors.torch import load_file
-    sd = standardize_lora_keys(load_file(lora_path))
+def _group_lora_parts(sd: dict) -> dict[str, dict]:
+    """Group standardized LoRA tensors by the base weight key."""
     groups: dict[str, dict] = {}
     for k, v in sd.items():
         if not isinstance(v, torch.Tensor):
@@ -291,6 +328,59 @@ def parse_lora(lora_path: str, strength: float = 1.0,
         if base is None:
             continue
         groups.setdefault(base, {})[kind] = v
+    return groups
+
+
+def _make_entry(base: str, parts: dict, strength: float,
+                target: Optional[str] = None) -> LoraEntry:
+    if target is None:
+        target = base[: -len(".weight")] if base.endswith(".weight") else base
+    return LoraEntry(
+        target=target,
+        a=parts.get("a"), b=parts.get("b"),
+        alpha=parts.get("alpha"), strength=strength,
+        diff=parts.get("diff"), diff_b=parts.get("diff_b"),
+    )
+
+
+def _module_entry_of(t) -> SlotEntry:
+    """Transient SlotEntry over a live parameter or quantized tensor."""
+    inner = getattr(t, "data", t)
+    if hasattr(inner, "_qdata") and hasattr(inner, "_params"):
+        return SlotEntry.from_qt(inner)
+    return SlotEntry(data=inner)
+
+
+def fold_lora_into_module(module: torch.nn.Module, entries: list) -> None:
+    """Fold LoRA entries directly into a live module's parameters."""
+    if not entries:
+        return
+    slot = {
+        pname: _module_entry_of(p)
+        for pname, p in module.named_parameters()
+    }
+    fake_block = SimpleNamespace(lora=list(entries))
+    fold_lora_into_slot(fake_block, slot)
+    for pname, p in module.named_parameters():
+        entry = slot.get(pname)
+        if entry is not None and entry.is_qt:
+            entry.assign_to(module, pname[: -len(".weight")])
+
+
+# ---------------------------------------------------------------------------
+# LoRA file parsing -> BlockSwapManager.apply_lora payload
+# ---------------------------------------------------------------------------
+
+def parse_lora(lora_path: str, strength: float = 1.0,
+               block_prefix: str = "blocks."):
+    """Load + standardise a LoRA file and group entries per DiT block index.
+
+    Returns ``{block_idx: [LoraEntry, ...]}`` ready for
+    ``BlockSwapManager.apply_lora(idx, entries)``.
+    """
+    from safetensors.torch import load_file
+    sd = standardize_lora_keys(load_file(lora_path))
+    groups = _group_lora_parts(sd)
 
     out: dict[int, list] = {}
     for base, parts in groups.items():
@@ -301,11 +391,182 @@ def parse_lora(lora_path: str, strength: float = 1.0,
         idx_s, _, comp = rest.partition(".")
         if not idx_s.isdigit():
             continue
-        entry = LoraEntry(
-            target=comp[: -len(".weight")] if comp.endswith(".weight") else comp,
-            a=parts.get("a"), b=parts.get("b"),
-            alpha=parts.get("alpha"), strength=strength,
-            diff=parts.get("diff"), diff_b=parts.get("diff_b"),
-        )
+        comp = comp[: -len(".weight")] if comp.endswith(".weight") else comp
+        entry = _make_entry(base, parts, strength, target=comp)
         out.setdefault(int(idx_s), []).append(entry)
     return out
+
+
+def parse_lora_h3(lora_path: str, strength: float = 1.0,
+                  silu_grid_path: str = "") -> H3Lora:
+    """Parse a MiniMax H3 LoRA into all supported target groups."""
+    from safetensors.torch import load_file
+    sd = standardize_lora_keys(load_file(lora_path))
+    groups = _group_lora_parts(sd)
+
+    block_groups: dict[int, list[LoraEntry]] = {}
+    token_refiner_groups: dict[int, list[LoraEntry]] = {}
+    final_adaln: Optional[LoraEntry] = None
+    override_table = None
+    override_block_w: dict[int, torch.Tensor] = {}
+    override_block_b: dict[int, torch.Tensor] = {}
+    override_final_w = None
+    override_final_b = None
+
+    for base, parts in groups.items():
+        if base.startswith("blocks."):
+            rest = base[len("blocks."):]
+            idx_s, _, comp = rest.partition(".")
+            if not idx_s.isdigit():
+                continue
+            comp = comp[: -len(".weight")] if comp.endswith(".weight") else comp
+            block_groups.setdefault(int(idx_s), []).append(
+                _make_entry(base, parts, strength, target=comp))
+        elif base.startswith("token_refiner.blocks."):
+            rest = base[len("token_refiner.blocks."):]
+            idx_s, _, comp = rest.partition(".")
+            if not idx_s.isdigit():
+                continue
+            comp = comp[: -len(".weight")] if comp.endswith(".weight") else comp
+            token_refiner_groups.setdefault(int(idx_s), []).append(
+                _make_entry(base, parts, strength, target=comp))
+        elif base == "final_layer.adaln_proj.linear.weight":
+            final_adaln = _make_entry(
+                base, parts, strength, target="adaln_proj.linear")
+
+    for k, v in sd.items():
+        if k == "adaln_t_table":
+            override_table = v
+        elif k.startswith("blocks.") and ".adaln_proj.linear.weight" in k:
+            parts = k.split(".")
+            override_block_w[int(parts[1])] = v
+        elif k.startswith("blocks.") and ".adaln_proj.linear.bias" in k:
+            parts = k.split(".")
+            override_block_b[int(parts[1])] = v
+        elif k == "final_layer.adaln_proj.linear.weight":
+            override_final_w = v
+        elif k == "final_layer.adaln_proj.linear.bias":
+            override_final_b = v
+
+    adaln_override = None
+    if override_table is not None:
+        adaln_override = AdaLNOverride(
+            table=override_table,
+            block_weights=override_block_w,
+            block_biases=override_block_b,
+            final_weight=override_final_w,
+            final_bias=override_final_b,
+        )
+
+    return H3Lora(
+        path=lora_path,
+        strength=strength,
+        block_groups=block_groups,
+        token_refiner_groups=token_refiner_groups,
+        final_adaln=final_adaln,
+        silu_grid_path=silu_grid_path,
+        adaln_override=adaln_override,
+    )
+
+
+def load_silu_grid(path: str) -> torch.Tensor:
+    """Load the shared ``silu(t_emb)`` grid used by pruned AdaLN deltas."""
+    from ..utils.stream import BlockReader
+    if not path:
+        raise ValueError(
+            "pruned MiniMax H3 LoRA requires a silu(t_emb) grid; "
+            "select h3_silu_temb_grid.safetensors"
+        )
+    reader = BlockReader(path)
+    try:
+        return reader.get_tensors(["silu_t_emb_grid"])["silu_t_emb_grid"]
+    finally:
+        reader.close()
+
+
+class AdalnLoraState:
+    """Low-rank AdaLN delta for pruned/curve H3 bases.
+
+    The pruned base has an 8-dim ``adaln_t_table``, while the LoRA delta lives
+    in the full 2688-dim ``silu(t_emb)`` space.  Instead of folding into the
+    incompatible weight, this injects ``B @ A @ silu(t_emb)`` at runtime.
+    """
+
+    def __init__(self, grid: torch.Tensor,
+                 block_entries: dict[int, list[LoraEntry]],
+                 final_entries: list[LoraEntry]):
+        self.grid = grid
+        self.block_entries = dict(block_entries)
+        self.final_entries = list(final_entries)
+        self.current: Optional[torch.Tensor] = None
+        self._moved: dict = {}
+
+    def _move(self, t: torch.Tensor, device, dtype) -> torch.Tensor:
+        key = (id(t), device, dtype)
+        cached = self._moved.get(key)
+        if cached is None:
+            cached = t.to(device=device, dtype=dtype)
+            self._moved[key] = cached
+        return cached
+
+    def silu_temb(self, unique_t, device, dtype) -> torch.Tensor:
+        t = torch.tensor([float(v) for v in unique_t], dtype=torch.float32,
+                         device=self.grid.device)
+        pos = t.clamp(0.0, 1.0) * (self.grid.shape[0] - 1)
+        i0 = pos.floor().long().clamp(max=self.grid.shape[0] - 2)
+        rows = torch.lerp(self.grid[i0].float(),
+                          self.grid[i0 + 1].float(), (pos - i0).unsqueeze(1))
+        return rows.to(device=device, dtype=dtype)
+
+    def set_current(self, unique_t, device, dtype) -> None:
+        self.current = self.silu_temb(unique_t, device, dtype)
+
+    def entry_delta(self, entry: Optional[LoraEntry],
+                    st: torch.Tensor) -> Optional[torch.Tensor]:
+        if entry is None or entry.a is None or entry.b is None:
+            return None
+        a = self._move(entry.a, st.device, torch.float32)
+        b = self._move(entry.b, st.device, torch.float32)
+        st = st.to(torch.float32)
+        rank = a.shape[0]
+        alpha = entry.alpha
+        if alpha is None:
+            alpha_val = float(rank)
+        else:
+            try:
+                alpha_val = float(alpha.item() if alpha.numel() == 1 else alpha)
+            except Exception:
+                alpha_val = float(rank)
+        delta = (b @ (a @ st.T)).T
+        return delta * (entry.strength * (alpha_val / rank))
+
+    def apply_to_mods(self, mods, entries: Optional[list[LoraEntry]],
+                      st: torch.Tensor):
+        if mods is None or not entries:
+            return mods
+        delta = None
+        for entry in entries:
+            d = self.entry_delta(entry, st)
+            if d is None:
+                continue
+            delta = d if delta is None else delta + d
+        if delta is None:
+            return mods
+        hidden = mods[0].shape[-1]
+        total_rows = mods[0].shape[0]
+        delta = delta.reshape(total_rows, len(mods) * hidden)
+        chunks = delta.chunk(len(mods), dim=-1)
+        return tuple(
+            (c + d.to(device=c.device, dtype=c.dtype)).to(c.dtype)
+            for c, d in zip(mods, chunks)
+        )
+
+
+def attach_adaln_lora(model, state: AdalnLoraState) -> None:
+    """Attach runtime AdaLN deltas to the model's eager and cache paths."""
+    model._lora_adaln = state
+    for i, blk in enumerate(model.blocks):
+        if blk.adaln_proj is not None and i in state.block_entries:
+            blk.adaln_proj.attach_lora(state, state.block_entries[i])
+    if model.final_layer.adaln_proj is not None and state.final_entries:
+        model.final_layer.adaln_proj.attach_lora(state, state.final_entries)

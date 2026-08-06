@@ -5,15 +5,14 @@ Mirrors ComfyUI-BerniniRWrapper's ``nodes/bernini_sampling.py``:
 * ``H3ModelWrapper`` replaces ``CFGGuider`` — k-diffusion samplers call
   ``model(x, sigma, **extra_args)`` and get a denoised prediction back;
   guidance (cond/uncond combine) lives here.
-* ``h3_sample`` drives ``comfy.samplers.sampler_object(name).sample(...)``
-  with the H3 ``flow_sigmas`` grid (the model's own schedule math is
-  unchanged; only the integrator is now the official sampler).
+* ``h3_sample`` drives a ``comfy.samplers.KSAMPLER`` with the H3
+  ``flow_sigmas`` grid. Video advances on the video sigma clock while audio
+  is integrated on the model's shifted audio clock.
 
 The joint video+audio latent is packed into one flat vector
 ``cat([video.flatten(1), audio.flatten(1)], dim=1)``: packing is linear, so
-the sampler's linear updates (``x + dt * d``, noise scaling, re-noising) are
-exactly equivalent to stepping both streams independently — for euler this
-reproduces the old ``x += dt * v`` loop bit for bit.
+the sampler can update the video and audio halves independently without
+changing the packed layout.
 """
 
 from __future__ import annotations
@@ -28,10 +27,58 @@ import comfy.model_sampling
 import comfy.samplers
 import comfy.utils
 
-from ..models.model import flow_sigmas
+from ..models.model import flow_sigmas, time_shift_sigma, time_shift_slope
 from ..utils.injection import InjectionContext
 from ..utils.lifecycle import collect_garbage
 from ..utils.types import AVLatent, H3Conditioning, H3SampleResult
+
+SHIFT_V = 12.0
+SHIFT_A = 3.0
+
+
+def _h3_native_sampler(model, x, sigmas, extra_args=None, callback=None,
+                       disable=None, **kwargs):
+    """Native MiniMax-H3 AV dual-schedule integrator.
+
+    The video stream advances on the video sigma grid (default shift=12) while
+    the audio stream advances on its own shifted sigma grid (default shift=3).
+    This is the schedule used by the model's native training, so it is always
+    used by the MiniMax-H3 KSampler instead of a single packed-latent
+    schedule.  Overridable shifts are read from the wrapped model.
+    """
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    # KSAMPLER passes KSamplerX0Inpaint as `model`; the packed AV split point
+    # lives on H3ModelWrapper at model.inner_model.
+    nv = getattr(model, "_n_video", None)
+    if nv is None:
+        nv = getattr(getattr(model, "inner_model", None), "_n_video", None)
+    shift_v, shift_a = SHIFT_V, SHIFT_A
+    probe = model
+    for _ in range(2):
+        shift_v = float(getattr(probe, "_shift_video", shift_v))
+        shift_a = float(getattr(probe, "_shift_audio", shift_a))
+        probe = getattr(probe, "inner_model", None)
+        if probe is None:
+            break
+    for i in range(len(sigmas) - 1):
+        sv, sv_n = float(sigmas[i]), float(sigmas[i + 1])
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        out = (x - denoised) / sigmas[i]
+        if nv is None:
+            x = x + (sv_n - sv) * out
+        else:
+            xv, xa = x[..., :nv], x[..., nv:]
+            ov, oa = out[..., :nv], out[..., nv:]
+            xv = xv + (sv_n - sv) * ov
+            slope = time_shift_slope(max(sv, 1e-6), shift_v, shift_a)
+            xa = xa + (time_shift_sigma(sv_n, shift_v, shift_a) -
+                       time_shift_sigma(sv, shift_v, shift_a)) * (oa / slope)
+            x = torch.cat([xv, xa], dim=-1)
+        if callback is not None:
+            callback({"i": i, "denoised": denoised, "x": x,
+                      "sigma": sigmas[i], "sigma_hat": sigmas[i]})
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +117,7 @@ class _PatcherShim:
 class _SigmaCaptureModel:
     """Dummy k-diffusion model used to enumerate sampler sigma calls."""
 
-    def __init__(self, model_sampling):
+    def __init__(self, model_sampling, shift_video=SHIFT_V, shift_audio=SHIFT_A):
         self.inner_model = SimpleNamespace(
             model_sampling=model_sampling,
             inner_model=SimpleNamespace(model_sampling=model_sampling),
@@ -78,6 +125,8 @@ class _SigmaCaptureModel:
         self.model_patcher = _PatcherShim(self, model_sampling)
         self.cfg = 1.0
         self.captured = []
+        self._shift_video = float(shift_video)
+        self._shift_audio = float(shift_audio)
 
     def __call__(self, x, sigma, **kwargs):
         self.captured.append(float(sigma.flatten()[0]))
@@ -99,7 +148,8 @@ class H3ModelWrapper:
     def __init__(self, model, cfg: float, video_shape, audio_shape,
                  text_states: torch.Tensor, payload: dict,
                  neg_text_states: Optional[torch.Tensor] = None,
-                 neg_payload: Optional[dict] = None):
+                 neg_payload: Optional[dict] = None,
+                 shift_video: float = SHIFT_V, shift_audio: float = SHIFT_A):
         self.model = model
         self.cfg = float(cfg)
         self._video_shape = tuple(video_shape)
@@ -109,6 +159,8 @@ class H3ModelWrapper:
         self._payload = payload
         self._neg_text_states = neg_text_states
         self._neg_payload = neg_payload
+        self._shift_video = float(shift_video)
+        self._shift_audio = float(shift_audio)
 
         self.inner_model = _InnerShim()
         self.model_patcher = _PatcherShim(model, self.inner_model.model_sampling)
@@ -131,9 +183,13 @@ class H3ModelWrapper:
         s = float(sigma.flatten()[0])
         x_v, x_a = self.unpack(x)
 
-        v_v, v_a = self.model.velocity(x_v, x_a, s, self._text_states, self._payload)
+        v_v, v_a = self.model.velocity(
+            x_v, x_a, s, self._text_states, self._payload,
+            shift_video=self._shift_video, shift_audio=self._shift_audio)
         if self._neg_text_states is not None and self.cfg != 1.0:
-            u_v, u_a = self.model.velocity(x_v, x_a, s, self._neg_text_states, self._neg_payload)
+            u_v, u_a = self.model.velocity(
+                x_v, x_a, s, self._neg_text_states, self._neg_payload,
+                shift_video=self._shift_video, shift_audio=self._shift_audio)
             v_v = u_v + self.cfg * (v_v - u_v)
             v_a = u_a + self.cfg * (v_a - u_a)
 
@@ -151,7 +207,8 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
               sampler_name: str, shift_video: float, denoise: float, seed: int,
               injection: InjectionContext, preview_callback=None,
               disable_pbar: bool = False,
-              use_adaln_cache: bool = False) -> H3SampleResult:
+              use_adaln_cache: bool = False,
+              shift_audio: float = SHIFT_A) -> H3SampleResult:
     """Run H3 denoising through the official k-diffusion sampler loop.
 
     ``handle`` is the lifecycle ``ModelHandle``; the model is loaded with the
@@ -212,8 +269,11 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
     adaln_cache = None
     reader = None
     if use_adaln_cache and total_steps > 0:
-        samp = comfy.samplers.sampler_object(sampler_name)
-        capture = _SigmaCaptureModel(_H3ModelSampling())
+        samp = comfy.samplers.KSAMPLER(_h3_native_sampler)
+        capture = _SigmaCaptureModel(
+            _H3ModelSampling(),
+            shift_video=shift_video,
+            shift_audio=shift_audio)
         tiny = torch.zeros((1, 16), dtype=torch.float32)
         samp.sample(
             capture,
@@ -233,14 +293,21 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
         try:
             config = scan_dit_config(reader, MiniMaxH3DiTConfig())
             prefix = detect_key_prefix(reader)
+            if handle.loras:
+                has_adaln_lora = handle.loras.has_adaln
+                if has_adaln_lora and config.adaln_curve_grid is None:
+                    raise ValueError(
+                        "AdaLN pre-bake is not supported with a full-model "
+                        "LoRA fold yet; disable use_adaln_cache or use the "
+                        "pruned/curve base with runtime AdaLN injection."
+                    )
             from ..models.adaln import (
                 AdaLNCacheBaker,
                 AdaLNCachePlanner,
                 bake_adaln_entry,
             )
 
-            planner = AdaLNCachePlanner(
-                config.sigma_shift_video, config.sigma_shift_audio)
+            planner = AdaLNCachePlanner(shift_video, shift_audio)
             bake_plans = planner.build(
                 bake_sigmas, payload, layout, neg_payload, neg_layout)
             bake_pbar = None
@@ -287,7 +354,8 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             neg_payload["text_token_tags"] = negative.text_token_tags.to(device)
 
         wrapper = H3ModelWrapper(model, cfg, latent.video.shape, latent.audio.shape,
-                                 text_states, payload, neg_text_states, neg_payload)
+                                 text_states, payload, neg_text_states, neg_payload,
+                                 shift_video=shift_video, shift_audio=shift_audio)
 
         latent_packed = wrapper.pack(latent.video.to(device, handle.dtype),
                                      latent.audio.to(device, handle.dtype))
@@ -321,7 +389,7 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
                 x_v, _ = wrapper.unpack(x)
                 preview_callback(step, x0_v, x_v, total)
 
-        samp = comfy.samplers.sampler_object(sampler_name)
+        samp = comfy.samplers.KSAMPLER(_h3_native_sampler)
         out = samp.sample(
             wrapper, sigmas,
             extra_args={"model_options": {}, "seed": seed},

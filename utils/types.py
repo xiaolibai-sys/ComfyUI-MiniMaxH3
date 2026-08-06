@@ -289,6 +289,92 @@ class LoraEntry:
     diff_b: Optional[torch.Tensor] = None   # DoRA magnitude diff (per row)
 
 
+@dataclass
+class AdaLNOverride:
+    """Full AdaLN table/projection replacement for pruned model LoRAs."""
+    table: torch.Tensor
+    block_weights: dict[int, torch.Tensor] = field(default_factory=dict)
+    block_biases: dict[int, torch.Tensor] = field(default_factory=dict)
+    final_weight: Optional[torch.Tensor] = None
+    final_bias: Optional[torch.Tensor] = None
+
+
+@dataclass
+class H3Lora:
+    """Parsed LoRA payload attached to a MiniMax H3 model handle."""
+    path: str
+    strength: float = 1.0
+    block_groups: dict[int, list[LoraEntry]] = field(default_factory=dict)
+    token_refiner_groups: dict[int, list[LoraEntry]] = field(default_factory=dict)
+    final_adaln: Optional[LoraEntry] = None
+    silu_grid_path: str = ""
+    adaln_override: Optional[AdaLNOverride] = None
+
+
+@dataclass
+class H3LoraSet:
+    """Multi-LoRA payload attached to a MiniMax H3 model handle."""
+    loras: list[H3Lora] = field(default_factory=list)
+
+    def add(self, lora: H3Lora) -> None:
+        self.loras.append(lora)
+
+    def __bool__(self) -> bool:
+        return bool(self.loras)
+
+    @property
+    def block_groups(self) -> dict[int, list[LoraEntry]]:
+        merged: dict[int, list[LoraEntry]] = {}
+        for lora in self.loras:
+            for idx, entries in lora.block_groups.items():
+                merged.setdefault(idx, []).extend(entries)
+        return merged
+
+    @property
+    def token_refiner_groups(self) -> dict[int, list[LoraEntry]]:
+        merged: dict[int, list[LoraEntry]] = {}
+        for lora in self.loras:
+            for idx, entries in lora.token_refiner_groups.items():
+                merged.setdefault(idx, []).extend(entries)
+        return merged
+
+    @property
+    def final_adaln_entries(self) -> list[LoraEntry]:
+        return [l.final_adaln for l in self.loras if l.final_adaln is not None]
+
+    @property
+    def silu_grid_path(self) -> str:
+        for lora in self.loras:
+            if lora.silu_grid_path:
+                return lora.silu_grid_path
+        return ""
+
+    @property
+    def has_adaln(self) -> bool:
+        if self.adaln_override is not None:
+            return True
+        if self.final_adaln_entries:
+            return True
+        return any(
+            e.target == "adaln_proj.linear"
+            for entries in self.block_groups.values()
+            for e in entries
+        )
+
+    def signature(self) -> list[dict]:
+        return [
+            dict(path=l.path, strength=l.strength, silu_grid_path=l.silu_grid_path)
+            for l in self.loras
+        ]
+
+    @property
+    def adaln_override(self) -> Optional[AdaLNOverride]:
+        for lora in self.loras:
+            if lora.adaln_override is not None:
+                return lora.adaln_override
+        return None
+
+
 
 # ---------------------------------------------------------------------------
 # Conditioning payload (consumed by the sampler)

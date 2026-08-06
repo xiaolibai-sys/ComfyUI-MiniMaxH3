@@ -1,6 +1,7 @@
 """ComfyUI node registry for the MiniMax H3 runner."""
 
 from .loaders import MiniMaxH3Loader, MiniMaxH3VAELoader, MiniMaxH3EncoderLoader
+from .lora_loader import MiniMaxH3LoraLoader
 from .attention import MiniMaxH3AttentionConfig
 from .conditioning import MiniMaxH3Conditioning
 from .fl_constraint import MiniMaxH3FLConstraint
@@ -20,6 +21,7 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3Loader": MiniMaxH3Loader,
     "MiniMaxH3VAELoader": MiniMaxH3VAELoader,
     "MiniMaxH3EncoderLoader": MiniMaxH3EncoderLoader,
+    "MiniMaxH3LoraLoader": MiniMaxH3LoraLoader,
     "MiniMaxH3AttentionConfig": MiniMaxH3AttentionConfig,
     "MiniMaxH3Conditioning": MiniMaxH3Conditioning,
     "MiniMaxH3FLConstraint": MiniMaxH3FLConstraint,
@@ -40,6 +42,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3Loader": "MiniMax H3 Model Loader (Streaming)",
     "MiniMaxH3VAELoader": "MiniMax H3 VAE Loader",
     "MiniMaxH3EncoderLoader": "MiniMax H3 Text Encoder Loader",
+    "MiniMaxH3LoraLoader": "MiniMax H3 LoRA Loader",
     "MiniMaxH3AttentionConfig": "MiniMax H3 Attention Config",
     "MiniMaxH3Conditioning": "MiniMax H3 Conditioning",
     "MiniMaxH3FLConstraint": "MiniMax H3 FL Constraint",
