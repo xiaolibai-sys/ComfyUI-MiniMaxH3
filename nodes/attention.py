@@ -5,6 +5,8 @@ from __future__ import annotations
 from ..attention.backends import BACKEND_NAMES, available_backends, best_available
 from ..utils.types import AttentionConfig
 
+_DEFAULT_BACKEND = "sageattn2" if "sageattn2" in BACKEND_NAMES else "auto"
+
 
 class MiniMaxH3AttentionConfig:
     """Select the attention backend with automatic fallback.
@@ -19,7 +21,7 @@ class MiniMaxH3AttentionConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "backend": (BACKEND_NAMES, {"default": "sageattn2",
+                "backend": (BACKEND_NAMES, {"default": _DEFAULT_BACKEND,
                     "tooltip": "Attention backend. auto selects the best available backend: "
                                "Sage3 -> Sage2/1 -> FlashAttn -> SDPA-flash(torch) -> xformers -> SDPA -> SDPA-math"}),
                 "force_backend": ("BOOLEAN", {"default": False,
@@ -32,7 +34,7 @@ class MiniMaxH3AttentionConfig:
     FUNCTION = "configure"
     CATEGORY = "MiniMax-H3/loaders"
 
-    def configure(self, backend="sageattn2", force_backend=False):
+    def configure(self, backend=_DEFAULT_BACKEND, force_backend=False):
         cfg = AttentionConfig(
             backend=backend,
             force_backend=force_backend,

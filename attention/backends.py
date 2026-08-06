@@ -120,7 +120,10 @@ def _sage3_core(q, k, v):
         logger.warning(
             "SageAttention3 does not support seq_len > %d; using SageAttention2 "
             "for this attention call", _SAGE3_MAX_SEQ)
-        return _sage_core(q, k, v)
+        try:
+            return _sage_core(q, k, v)
+        except Exception:
+            return _sdpa_flash_core(q, k, v)
     from sageattn3 import sageattn3_blackwell
     return sageattn3_blackwell(q, k, v)
 
