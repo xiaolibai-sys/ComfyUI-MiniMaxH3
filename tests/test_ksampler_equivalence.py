@@ -1,8 +1,9 @@
 """KSampler equivalence test.
 
 The packed-AV k-diffusion path (nodes/h3_sampling.py, official comfy.samplers
-loop) must reproduce the old hand-written euler loop exactly (verified in
-float32: same noise draw order, same flow_sigmas grid, same velocity).
+loop) must reproduce a hand-written dual-clock euler loop exactly (verified in
+float32: same noise draw order, same flow_sigmas grid, same velocity, and the
+same audio clock mapping from shift=12 video sigma to shift=3 audio sigma).
 
 Also smoke-runs: an ancestral sampler (CONST/model_patcher shim path),
 TeaCache attach/detach, and the CFG cond+uncond path.
@@ -27,7 +28,12 @@ import zlib
 from safetensors.torch import save_file
 
 from h3rt.utils.config import MiniMaxH3DiTConfig
-from h3rt.models.model import MiniMaxH3Model, flow_sigmas
+from h3rt.models.model import (
+    MiniMaxH3Model,
+    flow_sigmas,
+    time_shift_sigma,
+    time_shift_slope,
+)
 from h3rt.utils.types import H3BlockSwap, H3TeaCache, H3Conditioning, AVLatent
 from h3rt.utils.lifecycle import load_model_handle
 from h3rt.utils.injection import InjectionContext
@@ -75,7 +81,7 @@ def _rel(a, b):
     return (a - b).abs().max().item() / max(1e-6, a.abs().max().item())
 
 
-# ---- reference: old hand-written euler loop -------------------------------
+# ---- reference: hand-written dual-clock euler loop -------------------------
 handle = load_model_handle(ckpt_path)
 m = handle.load(swap_config=swap)
 gen = torch.Generator("cpu").manual_seed(SEED)
@@ -89,7 +95,10 @@ for i in range(STEPS):
     v_v, v_a = m.velocity(x_v, x_a, s, text, cond.to_payload())
     dt = float(sigmas[i + 1]) - s
     x_v = x_v + dt * v_v
-    x_a = x_a + dt * v_a
+    slope = time_shift_slope(max(s, 1e-6), 12.0, 3.0)
+    dt_a = time_shift_sigma(float(sigmas[i + 1]), 12.0, 3.0) - \
+        time_shift_sigma(s, 12.0, 3.0)
+    x_a = x_a + dt_a * (v_a / slope)
 handle.unload()
 
 # ---- new path: official k-diffusion loop ----------------------------------
@@ -110,6 +119,43 @@ rel_cache_v = _rel(res_cache.video, result.video)
 rel_cache_a = _rel(res_cache.audio, result.audio)
 print(f"euler adaln-cache rel_err: video={rel_cache_v:.6f} audio={rel_cache_a:.6f}")
 assert rel_cache_v < 1e-4 and rel_cache_a < 1e-4, "AdaLN cache diverged from eager path"
+
+# ---- custom audio shift is passed into both forward and integrator ---------
+SA = 2.5
+m = handle.load(swap_config=swap)
+gen = torch.Generator("cpu").manual_seed(SEED)
+x_v = torch.randn(video.shape, generator=gen, dtype=torch.float32).to(device)
+x_a = torch.randn(audio.shape, generator=gen, dtype=torch.float32).to(device)
+for i in range(STEPS):
+    s = float(sigmas[i])
+    v_v, v_a = m.velocity(x_v, x_a, s, text, cond.to_payload(),
+                          shift_video=SHIFT, shift_audio=SA)
+    dt = float(sigmas[i + 1]) - s
+    x_v = x_v + dt * v_v
+    slope = time_shift_slope(max(s, 1e-6), SHIFT, SA)
+    dt_a = time_shift_sigma(float(sigmas[i + 1]), SHIFT, SA) - \
+        time_shift_sigma(s, SHIFT, SA)
+    x_a = x_a + dt_a * (v_a / slope)
+handle.unload()
+
+res_sa = h3_sample(
+    handle, cond, latent, None, STEPS, 1.0, "euler",
+    SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+    disable_pbar=True, shift_audio=SA)
+rel_sa_v = _rel(x_v, res_sa.video)
+rel_sa_a = _rel(x_a, res_sa.audio)
+print(f"euler shift_audio=2.5 rel_err: video={rel_sa_v:.6f} audio={rel_sa_a:.6f}")
+assert rel_sa_v < 1e-4 and rel_sa_a < 1e-4, "custom shift_audio diverged"
+
+res_sa_cache = h3_sample(
+    handle, cond, latent, None, STEPS, 1.0, "euler",
+    SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+    disable_pbar=True, use_adaln_cache=True, shift_audio=SA)
+rel_sa_cache_v = _rel(res_sa_cache.video, res_sa.video)
+rel_sa_cache_a = _rel(res_sa_cache.audio, res_sa.audio)
+print(f"euler shift_audio=2.5 adaln-cache rel_err: video={rel_sa_cache_v:.6f} audio={rel_sa_cache_a:.6f}")
+assert rel_sa_cache_v < 1e-4 and rel_sa_cache_a < 1e-4, \
+    "custom shift_audio AdaLN cache diverged"
 
 # ---- ancestral sampler (CONST + model_patcher shim path) -------------------
 res_a = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler_ancestral",

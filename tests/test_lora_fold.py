@@ -138,7 +138,34 @@ assert torch.allclose(got.float(), exp, atol=1e-5), "per-head q slice mismatch"
 assert torch.equal(got[hd:], wqkv[hd:]), "k/v rows must be untouched"
 print("per-head q-slice on fused qkv OK", flush=True)
 
-# ---------------- 7) parse_lora roundtrip ------------------------------------
+# ---------------- 7) multiple DoRA sequential stacking -----------------------
+w0 = torch.randn(out, inn)
+A1, B1 = torch.randn(rank, inn), torch.randn(out, rank)
+A2, B2 = torch.randn(rank, inn), torch.randn(out, rank)
+diff_b1, diff_b2 = torch.randn(out, 1), torch.randn(out, 1)
+slot = {"mlp.fc1.weight": SlotEntry(data=w0.clone())}
+entries = [
+    LoraEntry(target="mlp.fc1", a=A1, b=B1, alpha=None,
+              strength=0.8, diff_b=diff_b1),
+    LoraEntry(target="mlp.fc1", a=A2, b=B2, alpha=None,
+              strength=0.6, diff_b=diff_b2),
+]
+block = type("B", (), {"lora": entries})()
+fold_lora_into_slot(block, slot)
+
+w = w0.float()
+for A, B, diff_b, strength in (
+    (A1, B1, diff_b1, 0.8),
+    (A2, B2, diff_b2, 0.6),
+):
+    before_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    w = w + strength * B.float() @ A.float()
+    w = (before_norm + diff_b.float()).clamp(min=0.0) * w / \
+        w.norm(dim=1, keepdim=True).clamp(min=1e-8)
+assert torch.allclose(slot["mlp.fc1.weight"].data.float(), w, atol=1e-5)
+print("multiple DoRA sequential stacking OK", flush=True)
+
+# ---------------- 8) parse_lora roundtrip ------------------------------------
 sd = {
     "transformer.blocks.0.attn.qkv_proj.lora_A.weight": torch.randn(rank, inn),
     "transformer.blocks.0.attn.qkv_proj.lora_B.weight": torch.randn(out, rank),
