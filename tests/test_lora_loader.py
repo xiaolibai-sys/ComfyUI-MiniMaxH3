@@ -28,6 +28,7 @@ from h3rt.utils.types import (
     AVLatent,
     H3BlockSwap,
     H3Conditioning,
+    H3Lora,
     H3LoraSet,
     LoraEntry,
 )
@@ -65,6 +66,18 @@ assert len(multi.block_groups[0]) == 4
 assert len(multi.final_adaln_entries) == 2
 assert len(multi.signature()) == 2
 print("H3LoraSet multi-LoRA merge OK", flush=True)
+
+grid_set = H3LoraSet()
+grid_set.add(H3Lora(path="a", silu_grid_path="fl2va"))
+grid_set.add(H3Lora(path="b", silu_grid_path="fl2va"))
+assert grid_set.silu_grid_path == "fl2va"
+try:
+    grid_set.add(H3Lora(path="c", silu_grid_path="ref2va"))
+except ValueError:
+    pass
+else:
+    raise AssertionError("mixed silu grids should be rejected")
+print("H3LoraSet silu grid consistency OK", flush=True)
 
 
 # ---- live-module folding ------------------------------------------------

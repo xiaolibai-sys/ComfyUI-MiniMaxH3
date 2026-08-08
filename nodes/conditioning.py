@@ -60,23 +60,7 @@ def _make_av_latent(width, height, length):
     return AVLatent(video=video, audio=audio)
 
 
-def _resolve_duration(prompt_ref, storyboard, package):
-    if storyboard is not None:
-        from .storyboard import compile_storyboard
-
-        plan = compile_storyboard(storyboard, package)
-        text = str(prompt_ref.get("text") or "") if prompt_ref is not None else ""
-        negative = (
-            str(prompt_ref.get("negative_prompt") or "")
-            if prompt_ref is not None
-            else ""
-        )
-        return (
-            plan["frame_count"],
-            plan["total_duration"],
-            text or str(plan["text"]),
-            negative or str(plan["negative_prompt"]),
-        )
+def _resolve_duration(prompt_ref, package):
     if prompt_ref is not None:
         frame_count = prompt_ref.get("frame_count")
         if not frame_count:
@@ -109,7 +93,6 @@ class MiniMaxH3Conditioning:
                 "av_encoder": ("MINIMAX_H3_AV_ENCODER",),
                 "fl_constraint": ("MINIMAX_H3_FL_CONSTRAINT",),
                 "package": ("PACKAGE_DATA",),
-                "storyboard": ("MINIMAX_H3_STORYBOARD",),
                 "prompt": ("MINIMAX_H3_PROMPT",),
                 "ref_max": ("INT", {"default": 1280, "min": 32, "max": 4096,
                     "step": 32, "display": "slider",
@@ -123,32 +106,25 @@ class MiniMaxH3Conditioning:
     CATEGORY = "MiniMax-H3/conditioning"
 
     def make(self, text_encoder, prompt="", negative_prompt="", width=1344, height=768,
-             av_encoder=None, fl_constraint=None, package=None, storyboard=None,
-             prompt_ref=None, ref_max=1280):
+             av_encoder=None, fl_constraint=None, package=None, ref_max=1280):
         if isinstance(prompt, dict):
             prompt_ref = prompt
             prompt = str(prompt.get("text") or "")
+        else:
+            prompt_ref = None
         if prompt_ref is not None:
             frame_count, total_duration, ref_text, ref_negative = _resolve_duration(
-                prompt_ref, storyboard, package)
+                prompt_ref, package)
             if ref_text:
                 prompt = ref_text
             if ref_negative:
                 negative_prompt = ref_negative
-        elif storyboard is not None:
-            frame_count, total_duration, ref_text, ref_negative = _resolve_duration(
-                prompt_ref, storyboard, package)
-            if not prompt.strip():
-                prompt = ref_text
-            if not negative_prompt.strip():
-                negative_prompt = ref_negative
         else:
             frame_count, total_duration, _, _ = _resolve_duration(
-                prompt_ref, storyboard, package)
+                prompt_ref, package)
         if not prompt.strip():
             raise ValueError(
-                "MiniMax H3 Conditioning: prompt_ref or storyboard did not "
-                "provide a prompt."
+                "MiniMax H3 Conditioning: prompt did not provide a prompt."
             )
         length = frame_count
         if package is not None and fl_constraint is not None:
@@ -224,8 +200,8 @@ class MiniMaxH3Conditioning:
 
         if not kwargs:
             return MiniMaxH3Conditioning().make(
-                text_encoder, prompt, negative_prompt, width, height,
-                prompt_ref={
+                text_encoder, "", "", width, height,
+                prompt={
                     "text": prompt,
                     "negative_prompt": negative_prompt,
                     "frame_count": length,
@@ -238,8 +214,8 @@ class MiniMaxH3Conditioning:
             text_encoder, av_encoder, prompt, width, height, length, "match",
             ref_max=ref_max, **kwargs)
         _, neg_cond, _ = MiniMaxH3Conditioning().make(
-            text_encoder, prompt, negative_prompt, width, height,
-            prompt_ref={
+            text_encoder, "", "", width, height,
+            prompt={
                 "text": prompt,
                 "negative_prompt": negative_prompt,
                 "frame_count": length,

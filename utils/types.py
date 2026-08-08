@@ -317,6 +317,14 @@ class H3LoraSet:
     loras: list[H3Lora] = field(default_factory=list)
 
     def add(self, lora: H3Lora) -> None:
+        if self.loras and lora.silu_grid_path:
+            current = self.silu_grid_path
+            if current and current != lora.silu_grid_path:
+                raise ValueError(
+                    "MiniMax H3 multi-LoRA: all runtime AdaLN LoRAs must use "
+                    "the same silu(t_emb) grid; got "
+                    f"{current} and {lora.silu_grid_path}."
+                )
         self.loras.append(lora)
 
     def __bool__(self) -> bool:

@@ -18,6 +18,7 @@ from h3rt.nodes.refiner import (
     MiniMaxH3SimplePrompt,
     _prepare_refiner_input,
 )
+from h3rt.nodes.storyboard import compile_storyboard
 
 
 assert "<Subject N> (Sx)" in _SYSTEM_PROMPT
@@ -74,19 +75,16 @@ assert calls[0][1]["ratio"] == "16:9"
 assert calls[0][1]["content"][0]["type"] == "text"
 
 
+ctx_plan = compile_storyboard({
+    "mode": "full_reference",
+    "ratio": "adaptive",
+    "total_duration": 5.0,
+    "shots": [
+        {"duration": 5.0, "prompt": "A dancer moves through the room."},
+    ],
+})
 ctx_prompt, ctx_mode, ctx_frames, ctx_duration, ctx_ratio = _prepare_refiner_input(
-    {
-        "mode": "full_reference",
-        "ratio": "adaptive",
-        "total_duration": 5.0,
-        "shots": [
-            {"duration": 5.0, "prompt": "A dancer moves through the room."},
-        ],
-    },
-    None,
-    None,
-    None,
-)
+    ctx_plan, None, None)
 assert "A dancer moves through the room." in ctx_prompt
 assert ctx_mode == "full_reference"
 assert ctx_frames == 124
@@ -94,42 +92,28 @@ assert ctx_duration == 5.0
 assert ctx_ratio == "adaptive"
 
 ctx_node = MiniMaxH3ContextIRRefiner().polish(
-    storyboard={
-        "mode": "full_reference",
-        "ratio": "adaptive",
-        "total_duration": 5.0,
-        "shots": [
-            {"duration": 5.0, "prompt": "A dancer moves through the room."},
-        ],
-    }
+    prompt=ctx_plan
 )
 assert ctx_node["result"][0]["frame_count"] == 124
 assert ctx_node["result"][0]["total_duration"] == 5.0
 assert ctx_node["result"][0]["ratio"] == "adaptive"
 
 openai_prompt, openai_mode, openai_frames, _, _ = _prepare_refiner_input(
-    None,
-    {"text": "chat prompt", "mode": None},
-    None,
-    None,
+    {"text": "chat prompt", "mode": None}, None, None,
 )
 assert openai_prompt == "chat prompt"
 assert openai_mode == "T2VA"
 assert openai_frames is None
 
 fl_prompt, fl_mode, _, _, fl_ratio = _prepare_refiner_input(
-    None,
-    {"text": "fl2v prompt", "mode": "FL2VA"},
-    None,
+    {"text": "fl2v prompt", "mode": "FL2VA"}, None,
     {"first_frame": object(), "last_frame": object()},
 )
 assert fl_mode == "FL2VA"
 assert fl_ratio == "adaptive"
 
 first_only, first_mode, _, _, first_ratio = _prepare_refiner_input(
-    None,
-    {"text": "fl2v prompt", "mode": "FL2VA"},
-    None,
+    {"text": "fl2v prompt", "mode": "FL2VA"}, None,
     {"first_frame": object(), "last_frame": None},
 )
 assert first_mode == "I2VA"
@@ -199,7 +183,7 @@ assert "reasoning_effort" not in chat_calls[-1][2]
 openai_node = MiniMaxH3OpenAICompatibleRefiner().polish(
     base_url="http://127.0.0.1:8000/v1",
     model="local-model",
-    prompt_ref=simple_prompt,
+    prompt=simple_prompt,
 )
 node_user_text = chat_calls[-1][2]["messages"][-1]["content"]
 assert "Target video duration: 5.167 seconds (124 frames at 24fps)" in node_user_text

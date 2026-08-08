@@ -418,18 +418,25 @@ def check_i2v_conditioning():
             "total_duration": 5 / 24,
         }
         cond = MiniMaxH3Conditioning().make(
-            FakeEncoder(), "a cat", "", 64, 64, FakeVae(),
+            FakeEncoder(),
+            prompt=prompt_ref,
+            width=64,
+            height=64,
+            av_encoder=FakeVae(),
             fl_constraint={"first_frame": img1, "last_frame": img2},
-            prompt_ref=prompt_ref)[0]
+        )[0]
         assert captured["prompt"] == "a cat"
         assert [i["type"] for i in captured["items"]] == ["image", "image"]
         assert [k["resolved_frame_index"] for k in cond.keyframes] == [0, 4]
         assert len(cond.keyframes) == 2
         try:
             MiniMaxH3Conditioning().make(
-                FakeEncoder(), "a cat", "", 64, 64, None,
+                FakeEncoder(),
+                prompt=prompt_ref,
+                width=64,
+                height=64,
                 fl_constraint={"first_frame": img1},
-                prompt_ref=prompt_ref)
+            )
             raise AssertionError("I2V without VAE should fail")
         except ValueError:
             pass
