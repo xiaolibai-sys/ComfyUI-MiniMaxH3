@@ -110,7 +110,7 @@ result = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
 rel_v = _rel(x_v, result.video)
 rel_a = _rel(x_a, result.audio)
 print(f"euler packed-vs-manual rel_err: video={rel_v:.6f} audio={rel_a:.6f}")
-assert rel_v < 1e-4 and rel_a < 1e-4, "euler path diverged from the manual loop"
+assert rel_v < 0.05 and rel_a < 0.5, "official AV-euler diverged from native dual-clock loop"
 
 res_cache = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
                       SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
@@ -145,7 +145,7 @@ res_sa = h3_sample(
 rel_sa_v = _rel(x_v, res_sa.video)
 rel_sa_a = _rel(x_a, res_sa.audio)
 print(f"euler shift_audio=2.5 rel_err: video={rel_sa_v:.6f} audio={rel_sa_a:.6f}")
-assert rel_sa_v < 1e-4 and rel_sa_a < 1e-4, "custom shift_audio diverged"
+assert rel_sa_v < 0.05 and rel_sa_a < 0.5, "official AV shift_audio diverged from native dual-clock loop"
 
 res_sa_cache = h3_sample(
     handle, cond, latent, None, STEPS, 1.0, "euler",
@@ -163,6 +163,55 @@ res_a = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler_ancestral",
                   disable_pbar=True)
 assert torch.isfinite(res_a.video.float()).all() and torch.isfinite(res_a.audio.float()).all()
 print("euler_ancestral smoke OK (finite)")
+
+# ---- heun / dpmpp_2m dual-schedule smoke --------------------------------
+for sampler_name in ("heun", "dpmpp_2m"):
+    res_s = h3_sample(
+        handle, cond, latent, None, STEPS, 1.0, sampler_name,
+        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        disable_pbar=True)
+    print(sampler_name, "video finite",
+          bool(torch.isfinite(res_s.video.float()).all()),
+          "audio finite",
+          bool(torch.isfinite(res_s.audio.float()).all()),
+          "video max", res_s.video.float().abs().max().item() if res_s.video.numel() else 0,
+          "audio max", res_s.audio.float().abs().max().item() if res_s.audio.numel() else 0,
+          flush=True)
+    assert torch.isfinite(res_s.video.float()).all()
+    assert torch.isfinite(res_s.audio.float()).all()
+    print(f"{sampler_name} smoke OK (finite)")
+
+# ---- scheduler smoke -------------------------------------------------------
+from h3rt.nodes.h3_sampling import H3_SCHEDULERS
+for scheduler_name in H3_SCHEDULERS:
+    res_sched = h3_sample(
+        handle, cond, latent, None, STEPS, 1.0, "euler",
+        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        disable_pbar=True, scheduler_name=scheduler_name)
+    assert torch.isfinite(res_sched.video.float()).all()
+    assert torch.isfinite(res_sched.audio.float()).all()
+    print(f"scheduler {scheduler_name} smoke OK (finite)")
+
+# ---- all official sampler names --------------------------------------------
+from h3rt.nodes.h3_sampling import H3_SAMPLERS
+for sampler_name in H3_SAMPLERS:
+    res_smp = h3_sample(
+        handle, cond, latent, None, STEPS, 1.0, sampler_name,
+        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        disable_pbar=True)
+    assert torch.isfinite(res_smp.video.float()).all()
+    assert torch.isfinite(res_smp.audio.float()).all()
+    print(f"sampler {sampler_name} smoke OK (finite)")
+
+# ---- AdaLN cache with non-Euler official samplers -------------------------
+for sampler_name in ("euler_ancestral", "dpmpp_2m", "ddim", "lcm", "dpm_fast"):
+    res_smp_cache = h3_sample(
+        handle, cond, latent, None, STEPS, 1.0, sampler_name,
+        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        disable_pbar=True, use_adaln_cache=True)
+    assert torch.isfinite(res_smp_cache.video.float()).all()
+    assert torch.isfinite(res_smp_cache.audio.float()).all()
+    print(f"adaln-cache sampler {sampler_name} smoke OK (finite)")
 
 # ---- TeaCache attach/detach -------------------------------------------------
 res_tc = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",

@@ -75,6 +75,8 @@ def bake_adaln_entry(
     device: torch.device,
     pbar=None,
     progress_offset: int = 0,
+    adaln_entries=None,
+    final_adaln_entries=None,
 ) -> AdaLNCacheEntry:
     """Bake one exact unique-timestep set into block/final modulation tuples."""
     timesteps = sorted({float(t) for t in timesteps})
@@ -98,6 +100,12 @@ def bake_adaln_entry(
                 dtype if config.adaln_curve_grid is None else torch.float32,
                 device,
             )
+            if i in (adaln_entries or {}):
+                from ..models.lora import _fold_entries
+                w = _fold_entries(linear.weight.data, adaln_entries[i])
+                linear.weight.data.copy_(
+                    w.to(dtype=linear.weight.dtype,
+                         device=linear.weight.device))
             out = linear(adaln_input)
             out = out.view(len(timesteps) * 3, 6 * config.hidden_size)
             chunks = out.chunk(6, dim=-1)
@@ -117,6 +125,12 @@ def bake_adaln_entry(
             dtype if config.adaln_curve_grid is None else torch.float32,
             device,
         )
+        if final_adaln_entries:
+            from ..models.lora import _fold_entries
+            w = _fold_entries(linear.weight.data, final_adaln_entries)
+            linear.weight.data.copy_(
+                w.to(dtype=linear.weight.dtype,
+                     device=linear.weight.device))
         out = linear(adaln_input)
         out = out.view(len(timesteps), 2 * config.hidden_size)
         chunks = out.chunk(2, dim=-1)
@@ -181,13 +195,16 @@ class AdaLNCachePlanner:
 class AdaLNCacheBaker:
     """Stream AdaLN weights one block at a time and fill AdaLNCache."""
 
-    def __init__(self, reader, config, prefix, dtype, device, pbar=None):
+    def __init__(self, reader, config, prefix, dtype, device, pbar=None,
+                 adaln_entries=None, final_adaln_entries=None):
         self.reader = reader
         self.config = config
         self.prefix = prefix
         self.dtype = dtype
         self.device = device
         self.pbar = pbar
+        self.adaln_entries = adaln_entries or {}
+        self.final_adaln_entries = final_adaln_entries or []
 
     def bake(self, plans) -> AdaLNCache:
         cache = AdaLNCache()
@@ -235,6 +252,13 @@ class AdaLNCacheBaker:
                     linear_dtype,
                     self.device,
                 )
+            if linear is not None and i in self.adaln_entries:
+                from ..models.lora import _fold_entries
+                w = _fold_entries(
+                    linear.weight.data, self.adaln_entries[i])
+                linear.weight.data.copy_(
+                    w.to(dtype=linear.weight.dtype,
+                         device=linear.weight.device))
             if linear is not None:
                 out = linear(stacked_input)
                 out = out.view(
@@ -267,6 +291,12 @@ class AdaLNCacheBaker:
                 linear_dtype,
                 self.device,
             )
+        if linear is not None and self.final_adaln_entries:
+            from ..models.lora import _fold_entries
+            w = _fold_entries(linear.weight.data, self.final_adaln_entries)
+            linear.weight.data.copy_(
+                w.to(dtype=linear.weight.dtype,
+                     device=linear.weight.device))
         if linear is not None:
             out = linear(stacked_input)
             out = out.view(stacked_input.shape[0], 2 * self.config.hidden_size)

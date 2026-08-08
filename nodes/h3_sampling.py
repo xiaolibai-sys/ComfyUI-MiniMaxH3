@@ -26,6 +26,12 @@ import comfy.model_management
 import comfy.model_sampling
 import comfy.samplers
 import comfy.utils
+from comfy.k_diffusion import sampling as k_diffusion_sampling
+from comfy.k_diffusion.sampling import (
+    default_noise_sampler,
+    get_ancestral_step,
+    to_d,
+)
 
 from ..models.model import flow_sigmas, time_shift_sigma, time_shift_slope
 from ..utils.injection import InjectionContext
@@ -34,6 +40,9 @@ from ..utils.types import AVLatent, H3Conditioning, H3SampleResult
 
 SHIFT_V = 12.0
 SHIFT_A = 3.0
+
+H3_SAMPLERS = list(comfy.samplers.KSampler.SAMPLERS)
+H3_SCHEDULERS = ["flow_uniform"] + list(comfy.samplers.KSampler.SCHEDULERS)
 
 
 def _h3_native_sampler(model, x, sigmas, extra_args=None, callback=None,
@@ -82,13 +91,228 @@ def _h3_native_sampler(model, x, sigmas, extra_args=None, callback=None,
 
 
 # ---------------------------------------------------------------------------
+# Dual-schedule samplers: official k-diffusion formulas + H3 video/audio sigma
+# ---------------------------------------------------------------------------
+
+def _probe_nv_shifts(model, nv=None, shift_v=SHIFT_V, shift_a=SHIFT_A):
+    if nv is None:
+        nv = getattr(model, "_n_video", None)
+        if nv is None:
+            nv = getattr(getattr(model, "inner_model", None), "_n_video", None)
+    probe = model
+    for _ in range(2):
+        shift_v = float(getattr(probe, "_shift_video", shift_v))
+        shift_a = float(getattr(probe, "_shift_audio", shift_a))
+        probe = getattr(probe, "inner_model", None)
+        if probe is None:
+            break
+    return nv, shift_v, shift_a
+
+
+def _audio_sigmas(sigmas, shift_v, shift_a):
+    return time_shift_sigma(
+        torch.as_tensor(sigmas, dtype=torch.float32, device=sigmas.device),
+        shift_v,
+        shift_a,
+    )
+
+
+def _slope(sigma, shift_v, shift_a):
+    return time_shift_slope(max(float(sigma), 1e-6), shift_v, shift_a)
+
+
+def _split(x, nv):
+    if nv is None:
+        return x, torch.zeros_like(x)
+    return x[..., :nv], x[..., nv:]
+
+
+def _dual_euler(model, x, sigmas, extra_args=None, callback=None,
+                disable=None, **kwargs):
+    extra_args = {} if extra_args is None else extra_args
+    nv, shift_v, shift_a = _probe_nv_shifts(model)
+    audio_sigmas = _audio_sigmas(sigmas, shift_v, shift_a)
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sv, sv_next = float(sigmas[i]), float(sigmas[i + 1])
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        d = to_d(x, sigmas[i], denoised)
+        xv, xa = _split(x, nv)
+        dv, da = _split(d, nv)
+        xv = xv + (sv_next - sv) * dv
+        sa = float(audio_sigmas[i])
+        sa_next = float(audio_sigmas[i + 1])
+        xa = xa + (sa_next - sa) * (da / _slope(sv, shift_v, shift_a))
+        x = torch.cat([xv, xa], dim=-1) if nv is not None else xv
+        if callback is not None:
+            callback({"i": i, "denoised": denoised, "x": x,
+                      "sigma": sigmas[i], "sigma_hat": sigmas[i]})
+    return x
+
+
+def _dual_euler_ancestral(model, x, sigmas, extra_args=None, callback=None,
+                          disable=None, eta=1.0, s_noise=1.0, **kwargs):
+    extra_args = {} if extra_args is None else extra_args
+    nv, shift_v, shift_a = _probe_nv_shifts(model)
+    audio_sigmas = _audio_sigmas(sigmas, shift_v, shift_a)
+    noise_sampler = default_noise_sampler(x, seed=extra_args.get("seed"))
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sv, sv_next = float(sigmas[i]), float(sigmas[i + 1])
+        sa, sa_next = float(audio_sigmas[i]), float(audio_sigmas[i + 1])
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        d = to_d(x, sigmas[i], denoised)
+        xv, xa = _split(x, nv)
+        dv, da = _split(d, nv)
+        sv_down, sv_up = get_ancestral_step(sv, sv_next, eta)
+        sa_down, sa_up = get_ancestral_step(sa, sa_next, eta)
+        slope = _slope(sv, shift_v, shift_a)
+        da_audio = da / slope
+        if callback is not None:
+            callback({"i": i, "denoised": denoised, "x": x,
+                      "sigma": sigmas[i], "sigma_hat": sigmas[i]})
+        noise = noise_sampler(sigmas[i], sigmas[i + 1])
+        noise_v, noise_a = _split(noise, nv)
+        if sv_down == 0:
+            denoised_v, _ = _split(denoised, nv)
+            xv = denoised_v
+        else:
+            xv = xv + (sv_down - sv) * dv + noise_v * s_noise * sv_up
+        if sa_down == 0:
+            xa = xa - sa * da_audio
+        else:
+            xa = xa + (sa_down - sa) * da_audio + noise_a * s_noise * sa_up
+        x = torch.cat([xv, xa], dim=-1) if nv is not None else xv
+    return x
+
+
+def _dual_heun(model, x, sigmas, extra_args=None, callback=None,
+               disable=None, **kwargs):
+    extra_args = {} if extra_args is None else extra_args
+    nv, shift_v, shift_a = _probe_nv_shifts(model)
+    audio_sigmas = _audio_sigmas(sigmas, shift_v, shift_a)
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sv, sv_next = float(sigmas[i]), float(sigmas[i + 1])
+        sa, sa_next = float(audio_sigmas[i]), float(audio_sigmas[i + 1])
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        d1 = to_d(x, sigmas[i], denoised)
+        xv, xa = _split(x, nv)
+        dv1, da1 = _split(d1, nv)
+        slope1 = _slope(sv, shift_v, shift_a)
+        x2v = xv + (sv_next - sv) * dv1
+        x2a = xa + (sa_next - sa) * (da1 / slope1)
+        x2 = torch.cat([x2v, x2a], dim=-1) if nv is not None else x2v
+        if callback is not None:
+            callback({"i": i, "denoised": denoised, "x": x,
+                      "sigma": sigmas[i], "sigma_hat": sigmas[i]})
+        if sv_next == 0:
+            xv = xv + (sv_next - sv) * dv1
+            xa = xa + (sa_next - sa) * (da1 / slope1)
+            x = torch.cat([xv, xa], dim=-1) if nv is not None else xv
+            continue
+        denoised2 = model(x2, sigmas[i + 1] * s_in, **extra_args)
+        d2 = to_d(x2, sigmas[i + 1], denoised2)
+        dv2, da2 = _split(d2, nv)
+        slope2 = _slope(sv_next, shift_v, shift_a)
+        xv = xv + (sv_next - sv) * (dv1 + dv2) / 2
+        xa = xa + (sa_next - sa) * (da1 / slope1 + da2 / slope2) / 2
+        x = torch.cat([xv, xa], dim=-1) if nv is not None else xv
+    return x
+
+
+def _dual_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None,
+                   disable=None, **kwargs):
+    extra_args = {} if extra_args is None else extra_args
+    nv, shift_v, shift_a = _probe_nv_shifts(model)
+    audio_sigmas = _audio_sigmas(sigmas, shift_v, shift_a)
+    s_in = x.new_ones([x.shape[0]])
+    old_v = None
+    old_a = None
+    prev_t_v = None
+    prev_t_a = None
+
+    def t_v(sigma):
+        return math.log(1.0 / max(float(sigma), 1e-12))
+
+    def t_a(sigma):
+        return math.log(1.0 / max(float(sigma), 1e-12))
+
+    for i in range(len(sigmas) - 1):
+        sv, sv_next = float(sigmas[i]), float(sigmas[i + 1])
+        sa, sa_next = float(audio_sigmas[i]), float(audio_sigmas[i + 1])
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({"i": i, "denoised": denoised, "x": x,
+                      "sigma": sigmas[i], "sigma_hat": sigmas[i]})
+        xv, xa = _split(x, nv)
+        dv, da = _split(to_d(x, sigmas[i], denoised), nv)
+        denoised_v, _ = _split(denoised, nv)
+        slope = _slope(sv, shift_v, shift_a)
+        audio_denoised = xa - sa * (da / slope)
+
+        tv, tv_next = t_v(sv), t_v(sv_next)
+        ta, ta_next = t_a(sa), t_a(sa_next)
+        hv, ha = tv_next - tv, ta_next - ta
+
+        if sv_next == 0:
+            xv = denoised_v
+        elif old_v is None:
+            xv = (sv_next / sv) * xv - math.expm1(-hv) * denoised_v
+        else:
+            rv = (tv - prev_t_v) / hv
+            denoised_d = (1 + 1 / (2 * rv)) * denoised_v - \
+                (1 / (2 * rv)) * old_v
+            xv = (sv_next / sv) * xv - math.expm1(-hv) * denoised_d
+
+        if sa_next == 0:
+            xa = audio_denoised
+        elif old_a is None:
+            xa = (sa_next / sa) * xa - math.expm1(-ha) * audio_denoised
+        else:
+            ra = (ta - prev_t_a) / ha
+            denoised_d = (1 + 1 / (2 * ra)) * audio_denoised - \
+                (1 / (2 * ra)) * old_a
+            xa = (sa_next / sa) * xa - math.expm1(-ha) * denoised_d
+
+        old_v = denoised_v
+        old_a = audio_denoised
+        prev_t_v = tv
+        prev_t_a = ta
+        x = torch.cat([xv, xa], dim=-1) if nv is not None else xv
+    return x
+
+
+H3_SAMPLER_FUNCTIONS = {
+    "euler": _dual_euler,
+    "euler_ancestral": _dual_euler_ancestral,
+    "heun": _dual_heun,
+    "dpmpp_2m": _dual_dpmpp_2m,
+}
+
+
+def _h3_sampler(sampler_name: str):
+    return H3_SAMPLER_FUNCTIONS.get(sampler_name, _dual_euler)
+
+
+def h3_sigmas(scheduler_name: str, steps: int, shift_video: float):
+    """Build an H3 flow sigma grid using the selected scheduler."""
+    if scheduler_name == "flow_uniform":
+        return flow_sigmas(steps, shift_video)
+    return comfy.samplers.calculate_sigmas(
+        _H3ModelSampling(), scheduler_name, steps)
+
+
+# ---------------------------------------------------------------------------
 # k-diffusion interface shims
 # ---------------------------------------------------------------------------
 
 class _H3ModelSampling(comfy.model_sampling.CONST,
                        comfy.model_sampling.ModelSamplingDiscreteFlow):
     """Flow-matching sigma behaviour (CONST) + discrete-flow sigma range."""
-    pass
+    def __init__(self):
+        super().__init__()
+        self.set_parameters(shift=SHIFT_V, timesteps=1000, multiplier=1000)
 
 
 class _InnerShim:
@@ -127,6 +351,7 @@ class _SigmaCaptureModel:
         self.captured = []
         self._shift_video = float(shift_video)
         self._shift_audio = float(shift_audio)
+        self._audio_scale = float(shift_video / shift_audio)
 
     def __call__(self, x, sigma, **kwargs):
         self.captured.append(float(sigma.flatten()[0]))
@@ -161,6 +386,7 @@ class H3ModelWrapper:
         self._neg_payload = neg_payload
         self._shift_video = float(shift_video)
         self._shift_audio = float(shift_audio)
+        self._audio_scale = float(shift_video / shift_audio)
 
         self.inner_model = _InnerShim()
         self.model_patcher = _PatcherShim(model, self.inner_model.model_sampling)
@@ -168,34 +394,79 @@ class H3ModelWrapper:
     # -- packed AV latent -------------------------------------------------
 
     def pack(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
-        return torch.cat([video.reshape(video.shape[0], -1),
-                          audio.reshape(audio.shape[0], -1)], dim=1)
+        return torch.cat([
+            video.reshape(video.shape[0], -1),
+            audio.reshape(audio.shape[0], -1) * self._audio_scale,
+        ], dim=1)
 
     def unpack(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         video = x[:, :self._n_video].reshape(self._video_shape)
-        audio = x[:, self._n_video:].reshape(self._audio_shape)
+        audio = (
+            x[:, self._n_video:].reshape(self._audio_shape)
+            / self._audio_scale
+        )
         return video, audio
 
     # -- k-diffusion interface --------------------------------------------
+
+    def _denoised(self, x_v, x_a_scaled, s, text_states, payload):
+        sigma_a = float(time_shift_sigma(s, self._shift_video, self._shift_audio))
+        audio_x = x_a_scaled * (sigma_a / max(s, 1e-6))
+        audio_x = audio_x.reshape(self._audio_shape)
+        v_v, v_a = self.model.velocity(
+            x_v, audio_x, s, text_states, payload,
+            shift_video=self._shift_video, shift_audio=self._shift_audio,
+            official_av=True)
+        x0_v = x_v.reshape(x_v.shape[0], -1) - s * v_v.reshape(v_v.shape[0], -1)
+        c = self._audio_scale
+        out_y = (
+            (1.0 - c) * audio_x
+            + (1.0 + (c - 1.0) * sigma_a) * v_a
+        ).reshape(x_v.shape[0], -1)
+        x0_a = x_a_scaled - s * out_y
+        return torch.cat([x0_v, x0_a], dim=-1)
 
     def __call__(self, x: torch.Tensor, sigma: torch.Tensor, **extra_args) -> torch.Tensor:
         comfy.model_management.throw_exception_if_processing_interrupted()
         s = float(sigma.flatten()[0])
         x_v, x_a = self.unpack(x)
+        x_a_scaled = x[..., self._n_video:]
 
-        v_v, v_a = self.model.velocity(
-            x_v, x_a, s, self._text_states, self._payload,
-            shift_video=self._shift_video, shift_audio=self._shift_audio)
-        if self._neg_text_states is not None and self.cfg != 1.0:
-            u_v, u_a = self.model.velocity(
-                x_v, x_a, s, self._neg_text_states, self._neg_payload,
-                shift_video=self._shift_video, shift_audio=self._shift_audio)
-            v_v = u_v + self.cfg * (v_v - u_v)
-            v_a = u_a + self.cfg * (v_a - u_a)
+        model_options = extra_args.get("model_options", {})
+        cond_denoised = self._denoised(
+            x_v, x_a_scaled, s, self._text_states, self._payload)
+        uncond_denoised = None
+        if self._neg_text_states is not None and (
+            self.cfg != 1.0 or model_options.get("disable_cfg1_optimization")
+        ):
+            uncond_denoised = self._denoised(
+                x_v, x_a_scaled, s,
+                self._neg_text_states, self._neg_payload)
 
-        x0_v = x_v - s * v_v
-        x0_a = x_a - s * v_a
-        return self.pack(x0_v, x0_a)
+        if uncond_denoised is None:
+            denoised = cond_denoised
+        else:
+            denoised = uncond_denoised + self.cfg * (
+                cond_denoised - uncond_denoised)
+
+        post_fns = model_options.get("sampler_post_cfg_function", [])
+        if uncond_denoised is None and post_fns:
+            uncond_denoised = cond_denoised
+        for fn in post_fns:
+            args = {
+                "denoised": denoised,
+                "cond": cond_denoised,
+                "uncond": uncond_denoised,
+                "cond_scale": self.cfg,
+                "model": self.model,
+                "uncond_denoised": uncond_denoised,
+                "cond_denoised": cond_denoised,
+                "sigma": sigma,
+                "model_options": model_options,
+                "input": x,
+            }
+            denoised = fn(args)
+        return denoised
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +479,8 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
               injection: InjectionContext, preview_callback=None,
               disable_pbar: bool = False,
               use_adaln_cache: bool = False,
-              shift_audio: float = SHIFT_A) -> H3SampleResult:
+              shift_audio: float = SHIFT_A,
+              scheduler_name: str = "normal") -> H3SampleResult:
     """Run H3 denoising through the official k-diffusion sampler loop.
 
     ``handle`` is the lifecycle ``ModelHandle``; the model is loaded with the
@@ -260,16 +532,18 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
         return H3SampleResult(video=latent.video, audio=latent.audio,
                               steps=0, sigmas=torch.zeros(0))
     if denoise >= 1.0:
-        sigmas = flow_sigmas(steps, shift_video)
+        sigmas = h3_sigmas(scheduler_name, steps, shift_video)
     else:
-        sigmas = flow_sigmas(int(steps / denoise), shift_video)[-(steps + 1):]
+        sigmas = h3_sigmas(scheduler_name, int(steps / denoise), shift_video)[
+            -(steps + 1):
+        ]
     sigmas = sigmas.to(device)
     total_steps = len(sigmas) - 1
 
     adaln_cache = None
     reader = None
     if use_adaln_cache and total_steps > 0:
-        samp = comfy.samplers.KSAMPLER(_h3_native_sampler)
+        samp = comfy.samplers.sampler_object(sampler_name)
         capture = _SigmaCaptureModel(
             _H3ModelSampling(),
             shift_video=shift_video,
@@ -293,14 +567,17 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
         try:
             config = scan_dit_config(reader, MiniMaxH3DiTConfig())
             prefix = detect_key_prefix(reader)
-            if handle.loras:
-                has_adaln_lora = handle.loras.has_adaln
-                if has_adaln_lora and config.adaln_curve_grid is None:
-                    raise ValueError(
-                        "AdaLN pre-bake is not supported with a full-model "
-                        "LoRA fold yet; disable use_adaln_cache or use the "
-                        "pruned/curve base with runtime AdaLN injection."
-                    )
+            adaln_bake_entries = {}
+            final_bake_entries = []
+            if handle.loras and config.adaln_curve_grid is None:
+                for idx, entries in handle.loras.block_groups.items():
+                    adaln = [
+                        e for e in entries
+                        if e.target == "adaln_proj.linear"
+                    ]
+                    if adaln:
+                        adaln_bake_entries[idx] = adaln
+                final_bake_entries = handle.loras.final_adaln_entries
             from ..models.adaln import (
                 AdaLNCacheBaker,
                 AdaLNCachePlanner,
@@ -315,7 +592,9 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
                 bake_pbar = comfy.utils.ProgressBar(
                     len(bake_plans) * (config.num_layers + 1))
             baker = AdaLNCacheBaker(
-                reader, config, prefix, dtype, device, pbar=bake_pbar)
+                reader, config, prefix, dtype, device, pbar=bake_pbar,
+                adaln_entries=adaln_bake_entries,
+                final_adaln_entries=final_bake_entries)
             adaln_cache = baker.bake(bake_plans)
         except Exception:
             reader.close()
@@ -330,7 +609,9 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             if reader is not None:
                 def bake_missing(key, unique_t):
                     entry = bake_adaln_entry(
-                        reader, config, prefix, unique_t, dtype, device)
+                        reader, config, prefix, unique_t, dtype, device,
+                        adaln_entries=adaln_bake_entries,
+                        final_adaln_entries=final_bake_entries)
                     adaln_cache.entries[key] = entry
                     return entry
                 model._adaln_bake_fallback = bake_missing
@@ -362,9 +643,14 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
 
         # official comfy.sample.prepare_noise: CPU generator, float32, then cast
         gen = torch.Generator("cpu").manual_seed(seed)
-        noise = wrapper.pack(
-            torch.randn(latent.video.shape, generator=gen, dtype=torch.float32),
-            torch.randn(latent.audio.shape, generator=gen, dtype=torch.float32))
+        noise_v = torch.randn(
+            latent.video.shape, generator=gen, dtype=torch.float32)
+        noise_a = torch.randn(
+            latent.audio.shape, generator=gen, dtype=torch.float32)
+        noise = torch.cat([
+            noise_v.reshape(noise_v.shape[0], -1),
+            noise_a.reshape(noise_a.shape[0], -1),
+        ], dim=1)
         noise = noise.to(device=device, dtype=handle.dtype)
 
         if tc is not None:
@@ -389,7 +675,7 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
                 x_v, _ = wrapper.unpack(x)
                 preview_callback(step, x0_v, x_v, total)
 
-        samp = comfy.samplers.KSAMPLER(_h3_native_sampler)
+        samp = comfy.samplers.sampler_object(sampler_name)
         out = samp.sample(
             wrapper, sigmas,
             extra_args={"model_options": {}, "seed": seed},

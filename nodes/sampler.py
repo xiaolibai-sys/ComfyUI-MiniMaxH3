@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from .h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
 
 
 class MiniMaxH3KSampler:
@@ -24,6 +25,8 @@ class MiniMaxH3KSampler:
                 "cfg": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0, "step": 0.1,
                     "tooltip": "Classifier-free guidance scale. 1.0 disables negative guidance; "
                                "values above 1.0 require a negative conditioning input."}),
+                "sampler_name": (H3_SAMPLERS, {"default": "euler"}),
+                "scheduler_name": (H3_SCHEDULERS, {"default": "normal"}),
                 "shift_video": ("FLOAT", {"default": 12.0, "min": 1.0, "max": 100.0}),
                 "shift_audio": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 100.0}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -45,7 +48,8 @@ class MiniMaxH3KSampler:
     CATEGORY = "MiniMax-H3/sampling"
 
     def sample(self, model, positive, seed, steps, cfg,
-               shift_video, shift_audio, denoise, use_adaln_cache,
+               sampler_name, scheduler_name, shift_video, shift_audio,
+               denoise, use_adaln_cache,
                negative=None, latent=None,
                teacache_args=None, block_swap_args=None):
         import comfy.utils
@@ -65,7 +69,8 @@ class MiniMaxH3KSampler:
 
         result = h3_sample(
             model, positive, latent, negative, steps, cfg,
-            sampler_name="euler",
+            sampler_name=sampler_name,
+            scheduler_name=scheduler_name,
             shift_video=shift_video,
             shift_audio=shift_audio,
             denoise=denoise,
