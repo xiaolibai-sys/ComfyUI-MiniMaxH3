@@ -467,8 +467,8 @@ class MiniMaxH3Storyboard:
             },
         }
 
-    RETURN_TYPES = ("MINIMAX_H3_STORYBOARD",)
-    RETURN_NAMES = ("Storyboard",)
+    RETURN_TYPES = ("MINIMAX_H3_PROMPT",)
+    RETURN_NAMES = ("prompt",)
     FUNCTION = "make"
     CATEGORY = "MiniMax-H3/data"
 
@@ -482,5 +482,5 @@ class MiniMaxH3Storyboard:
 
     def make(self, unique_id):
         data = _get_story(unique_id)
-        return (_normalize_storyboard(data) if data else
-                _normalize_storyboard(DEFAULT_STORYBOARD),)
+        return (compile_storyboard(
+            data if data else DEFAULT_STORYBOARD),)

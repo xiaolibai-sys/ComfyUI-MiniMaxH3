@@ -43,35 +43,13 @@ def _mode_from_fl_constraint(fl_constraint) -> str | None:
 
 
 def _prepare_refiner_input(
-    storyboard,
-    prompt_ref,
+    prompt,
     package,
     fl_constraint,
 ):
-    if storyboard is not None:
-        from .storyboard import compile_storyboard
-
-        plan = compile_storyboard(storyboard, package)
-        mode = str(plan["mode"] or "T2VA")
-        ratio = str(plan["ratio"] or "16:9")
-        if mode in ("I2VA", "FL2VA", "L2VA"):
-            ratio = "adaptive"
-        elif mode == "T2VA" and ratio == "adaptive":
-            ratio = "16:9"
-        fl_mode = _mode_from_fl_constraint(fl_constraint)
-        if fl_mode:
-            mode = fl_mode
-            ratio = "adaptive"
-        return (
-            plan["text"],
-            mode,
-            plan["frame_count"],
-            plan["total_duration"],
-            ratio,
-        )
-
-    if prompt_ref is not None:
-        prompt = str(prompt_ref.get("text") or "")
+    if prompt is not None:
+        prompt_ref = prompt if isinstance(prompt, dict) else {}
+        text = str(prompt_ref.get("text") or "")
         mode = str(prompt_ref.get("mode") or "")
         if not mode:
             if fl_constraint is not None:
@@ -93,7 +71,7 @@ def _prepare_refiner_input(
             mode = fl_mode
             ratio = "adaptive"
         return (
-            prompt,
+            text,
             mode,
             prompt_ref.get("frame_count"),
             prompt_ref.get("total_duration"),
@@ -160,8 +138,7 @@ class MiniMaxH3ContextIRRefiner:
                     "tooltip": "Non-diegetic music requirement. Empty = N/A."}),
             },
             "optional": {
-                "storyboard": ("MINIMAX_H3_STORYBOARD",),
-                "prompt_ref": ("MINIMAX_H3_PROMPT",),
+                "prompt": ("MINIMAX_H3_PROMPT",),
                 "package": ("PACKAGE_DATA",),
                 "fl_constraint": ("MINIMAX_H3_FL_CONSTRAINT",),
                 "timeout": ("INT", {"default": 300, "min": 10, "max": 3600}),
@@ -174,10 +151,10 @@ class MiniMaxH3ContextIRRefiner:
     CATEGORY = "MiniMax-H3/conditioning"
     OUTPUT_NODE = True
 
-    def polish(self, instruction="", music_style="", storyboard=None,
-               prompt_ref=None, package=None, fl_constraint=None, timeout=300):
+    def polish(self, instruction="", music_style="", prompt=None,
+               package=None, fl_constraint=None, timeout=300):
         prompt, output_mode, frame_count, duration, ratio = _prepare_refiner_input(
-            storyboard, prompt_ref, package, fl_constraint)
+            prompt, package, fl_constraint)
         if not prompt.strip():
             return _refiner_result({
                 "text": prompt, "mode": output_mode,
@@ -222,8 +199,7 @@ class MiniMaxH3OpenAICompatibleRefiner:
                     "tooltip": "Model or deployment name served by the endpoint."}),
             },
             "optional": {
-                "storyboard": ("MINIMAX_H3_STORYBOARD",),
-                "prompt_ref": ("MINIMAX_H3_PROMPT",),
+                "prompt": ("MINIMAX_H3_PROMPT",),
                 "package": ("PACKAGE_DATA",),
                 "fl_constraint": ("MINIMAX_H3_FL_CONSTRAINT",),
                 "api_key_env": ("STRING", {
@@ -262,13 +238,14 @@ class MiniMaxH3OpenAICompatibleRefiner:
     OUTPUT_NODE = True
 
     def polish(self, instruction="", music_style="", base_url="", model="",
-               storyboard=None, prompt_ref=None, package=None,
+               prompt=None, package=None,
                fl_constraint=None, api_key_env="",
                supports_image=False, supports_video=False, supports_audio=False,
                reasoning="auto", reasoning_effort="auto", temperature=1.0,
                top_p=0.95, max_tokens=0, timeout=120, extra_body_json=""):
+        prompt_obj = prompt
         prompt, output_mode, frame_count, duration, ratio = _prepare_refiner_input(
-            storyboard, prompt_ref, package, fl_constraint)
+            prompt, package, fl_constraint)
         if not prompt.strip():
             return _refiner_result({
                 "text": prompt, "mode": output_mode,
@@ -277,7 +254,10 @@ class MiniMaxH3OpenAICompatibleRefiner:
 
         from ..utils.refiners import polish_with_openai_compatible
 
-        subjects = storyboard.get("subjects") if storyboard is not None else None
+        subjects = (
+            prompt_obj.get("subjects")
+            if isinstance(prompt_obj, dict) else None
+        )
         text = polish_with_openai_compatible(
             prompt=prompt,
             base_url=base_url,
