@@ -103,8 +103,7 @@ assert mgr_b.home_size == mgr_b.total - mgr_b.window_size, \
     f"home={mgr_b.home_size} total={mgr_b.total} window={mgr_b.window_size}"
 assert len(mgr_b._xfer._home_pool) == max(mgr_b.home_size, 1)
 assert all(s is not None for s in mgr_b._xfer._home_pool)
-assert all(e.data.is_pinned() for pool in mgr_b._xfer._pin.slots if pool
-           for e in pool.values()), "pin stage not pinned"
+assert mgr_b._xfer._home_storage_tokens is not None, "home pool not registered"
 # after a full pass, every block is resident once: home + gpu == total
 resident = len(mgr_b._xfer._block_home) + len(mgr_b._window.on_gpu)
 print(f"home_size={mgr_b.home_size}/{mgr_b.total} resident(home+gpu)={resident}")

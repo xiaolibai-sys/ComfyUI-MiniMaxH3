@@ -161,6 +161,10 @@ Leave it empty to output `N/A`.
 - `MiniMax H3 KSampler.latent` is optional in the input schema only so the
   `negative` socket can appear above it. A missing latent raises a clear error.
 - `MiniMax H3 AdaLN cache` can pre-bake AdaLN modulations before sampling.
+  `dpm_adaptive` is excluded because its internal sigma schedule is chosen
+  from model errors at runtime; it always uses the eager AdaLN path. Full
+  checkpoints with original 2688-dim AdaLN LoRAs are baked through the
+  quantized base plus a low-rank output correction, avoiding full B@A folding.
 - `MiniMax H3 BlockSwap Args` is designed for low-VRAM use with a CPU home
   pool and optional disk prefetch.
 

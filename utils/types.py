@@ -53,6 +53,8 @@ class AdaLNCacheKey:
     unique_timesteps: tuple[float, ...]
     has_visual_cond: bool
     has_audio_cond: bool
+    shift_video: float = 12.0
+    shift_audio: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -444,6 +446,11 @@ class H3SampleResult:
     swap_hits: int = 0          # blocks reused from the GPU ring
     swap_loads: int = 0         # blocks pulled from RAM/disk
     peak_vram_mb: float = 0.0
+    d2h_stage: int = 0
+    d2h_direct: int = 0
+    d2h_host_register: int = 0
+    d2h_sync: int = 0
+    prebake_seconds: float = 0.0
 
     @property
     def av(self) -> AVLatent:

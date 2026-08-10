@@ -16,7 +16,8 @@ class MiniMaxH3BlockSwapArgs:
                     "tooltip": "Number of DiT blocks to swap off GPU (50 total; "
                                "resident blocks = 50 - block_to_swap). 0 keeps all blocks resident."}),
                 "hot_blocks": ("INT", {"default": 0, "min": 0, "max": 50,
-                    "tooltip": "Leading DiT blocks kept permanently on GPU; these avoid H2D/D2H every pass."}),
+                    "tooltip": "Leading DiT blocks kept permanently on GPU; these avoid H2D/D2H every pass. "
+                               "Effective value is capped at resident window - 1."}),
                 "prefetch": ("BOOLEAN", {"default": True,
                     "tooltip": "Prefetch the next block window from disk into RAM in the background."}),
                 "prefetch_count": ("INT", {"default": 2, "min": 1, "max": 8,

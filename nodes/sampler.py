@@ -32,7 +32,12 @@ class MiniMaxH3KSampler:
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "use_adaln_cache": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Pre-bake AdaLN modulations and skip AdaLN weights during sampling."}),
+                    "tooltip": "Pre-bake AdaLN modulations and skip AdaLN weights during sampling. "
+                               "dpm_adaptive keeps the eager AdaLN path because its sigma schedule "
+                               "is model-adaptive."}),
+                "adaln_prebake_batch": ("INT", {
+                    "default": 3, "min": 1, "max": 16,
+                    "tooltip": "Number of AdaLN blocks baked per GPU batch during prebake."}),
             },
             "optional": {
                 "negative": ("MINIMAX_H3_COND",),
@@ -49,7 +54,7 @@ class MiniMaxH3KSampler:
 
     def sample(self, model, positive, seed, steps, cfg,
                sampler_name, scheduler_name, shift_video, shift_audio,
-               denoise, use_adaln_cache,
+               denoise, use_adaln_cache, adaln_prebake_batch,
                negative=None, latent=None,
                teacache_args=None, block_swap_args=None):
         import comfy.utils
@@ -78,10 +83,15 @@ class MiniMaxH3KSampler:
             injection=injection,
             preview_callback=callback,
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-            use_adaln_cache=use_adaln_cache)
+            use_adaln_cache=use_adaln_cache,
+            adaln_prebake_batch=adaln_prebake_batch)
 
         stats = (f"steps={result.steps} swap_hits={result.swap_hits} "
-                 f"swap_loads={result.swap_loads} peak_vram={result.peak_vram_mb:.0f}MiB")
+                 f"swap_loads={result.swap_loads} peak_vram={result.peak_vram_mb:.0f}MiB "
+                 f"d2h_stage={result.d2h_stage} "
+                 f"d2h_direct={result.d2h_direct} "
+                 f"d2h_host={result.d2h_host_register} "
+                 f"d2h_sync={result.d2h_sync}")
         return (result.av, stats)
 
 

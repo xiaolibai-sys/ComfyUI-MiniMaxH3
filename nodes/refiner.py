@@ -96,6 +96,11 @@ class MiniMaxH3SimplePrompt:
                 "ratio": (["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"], {
                     "default": "16:9"}),
             },
+            "optional": {
+                "negative_text": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": "Optional negative prompt attached to this conditioning."}),
+            },
         }
 
     RETURN_TYPES = ("MINIMAX_H3_PROMPT", "STRING")
@@ -103,7 +108,8 @@ class MiniMaxH3SimplePrompt:
     FUNCTION = "make"
     CATEGORY = "MiniMax-H3/prompt"
 
-    def make(self, text="", mode="T2VA", total_duration=5.0, ratio="16:9"):
+    def make(self, text="", mode="T2VA", total_duration=5.0, ratio="16:9",
+             negative_text=""):
         from .conditioning import align_frame_count
 
         text = str(text or "")
@@ -115,6 +121,7 @@ class MiniMaxH3SimplePrompt:
             "frame_count": frame_count,
             "total_duration": total_duration,
             "ratio": ratio,
+            "negative_prompt": str(negative_text or ""),
         }, text)
 
 

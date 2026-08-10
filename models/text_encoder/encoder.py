@@ -328,6 +328,126 @@ class TextEncoder:
             return self._encode_multimodal(payload, pool_mode)
         return self._encode_text(payload, pool_mode)
 
+    @torch.inference_mode()
+    def encode_many(self, payloads, pool_modes=None) -> list[TextEncoderOutput]:
+        """Run several payloads through the same streamed groups.
+
+        Each decoder group is loaded once, applied to every payload, then
+        released before the next group.  This is the memory-safe way to share
+        one streaming pass between positive and negative conditioning.
+        """
+        if pool_modes is None:
+            pool_modes = [PoolMode.LAST] * len(payloads)
+        if len(payloads) == 1:
+            return [self.encode(payloads[0], pool_modes[0])]
+
+        prepared = [
+            self._prepare_encode(payload, pool_mode)
+            for payload, pool_mode in zip(payloads, pool_modes)
+        ]
+        hiddens = [
+            self._run_streamed_many(
+                [p["hidden"] for p in prepared],
+                [p["position_embeddings"] for p in prepared],
+                [p["attn_mask"] for p in prepared],
+                [p["visual_pos_masks"] for p in prepared],
+                [p["deepstack_visual_embeds"] for p in prepared],
+            )
+        ]
+        outputs = []
+        for hidden, p in zip(hiddens[0], prepared):
+            hidden = self.model.norm(hidden)
+            pooled = pool_hidden_states(
+                hidden, p["pool_mask"], p["pool_mode"])
+            outputs.append(TextEncoderOutput(
+                last_hidden_state=hidden,
+                pooled_embedding=pooled,
+                input_ids=p["input_ids"],
+                attention_mask=p["attention_mask"],
+                token_tags=p.get("token_tags"),
+            ))
+        return outputs
+
+    def _prepare_encode(self, payload, pool_mode: PoolMode) -> dict:
+        """Build input embeds/masks for one text or multimodal payload."""
+        has_vision = (payload.images is not None or payload.videos is not None
+                      or payload.pixel_values is not None
+                      or payload.pixel_values_videos is not None
+                      or payload.minimax_ref_items is not None)
+        if has_vision:
+            if self.fusion is None:
+                raise RuntimeError(
+                    "checkpoint has no vision tower (no 'model.visual.*' "
+                    "tensors); cannot process images/videos")
+            input_ids, attention_mask, mm, tags = (
+                self._prepare_multimodal_inputs(payload))
+            fused = self.fusion.forward(
+                input_ids=input_ids, attention_mask=attention_mask,
+                pixel_values=mm.get("pixel_values"),
+                image_grid_thw=mm.get("image_grid_thw"),
+                pixel_values_videos=mm.get("pixel_values_videos"),
+                video_grid_thw=mm.get("video_grid_thw"),
+                mm_token_type_ids=mm.get("mm_token_type_ids"))
+            hidden = fused.inputs_embeds
+            position_embeddings = self.model.rotary_emb(
+                hidden, fused.position_ids)
+            attn_mask = build_attention_mask(
+                attention_mask, input_ids.shape[1], self.device, self.dtype)
+            pool_mask = attention_mask
+            if pool_mask is not None and mm.get("mm_token_type_ids") is not None:
+                pool_mask = (attention_mask.bool()
+                             & (mm["mm_token_type_ids"] == 0))
+            return dict(
+                hidden=hidden,
+                position_embeddings=position_embeddings,
+                attn_mask=attn_mask,
+                visual_pos_masks=fused.visual_pos_masks,
+                deepstack_visual_embeds=fused.deepstack_visual_embeds,
+                pool_mask=pool_mask,
+                pool_mode=pool_mode,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_tags=tags,
+            )
+        input_ids, attention_mask = self._prepare_text_inputs(payload)
+        hidden = self.model.embed_tokens(input_ids.to(self.device))
+        position_embeddings = self.model.rotary_emb(
+            hidden, build_position_ids(input_ids, self.device))
+        attn_mask = build_attention_mask(
+            attention_mask, input_ids.shape[1], self.device, self.dtype)
+        return dict(
+            hidden=hidden,
+            position_embeddings=position_embeddings,
+            attn_mask=attn_mask,
+            visual_pos_masks=None,
+            deepstack_visual_embeds=None,
+            pool_mask=attention_mask,
+            pool_mode=pool_mode,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_tags=None,
+        )
+
+    def _run_streamed_many(self, hiddens, position_embeddings, attn_masks,
+                           visual_pos_masks, deepstack_visual_embeds):
+        """Run one streamed pass over multiple hidden states group by group."""
+        num_groups = len(self.streamer.groups)
+        for g in range(num_groups):
+            spec = self.streamer.groups[g]
+            self.streamer.load_group(g)
+            if self.stream_config.prefetch:
+                self.streamer.prefetch_next(g + 1)
+            hiddens = [
+                self.model.run_layer_group(
+                    h, spec.layer_start, spec.layer_end,
+                    pe, am, vpm, ds)
+                for h, pe, am, vpm, ds in zip(
+                    hiddens, position_embeddings, attn_masks,
+                    visual_pos_masks, deepstack_visual_embeds)
+            ]
+            self.streamer.release_group(g)
+        return hiddens
+
     def _encode_text(self, payload: TextEncoderInput,
                      pool_mode: PoolMode) -> TextEncoderOutput:
         input_ids, attention_mask = self._prepare_text_inputs(payload)

@@ -213,6 +213,37 @@ for sampler_name in ("euler_ancestral", "dpmpp_2m", "ddim", "lcm", "dpm_fast"):
     assert torch.isfinite(res_smp_cache.audio.float()).all()
     print(f"adaln-cache sampler {sampler_name} smoke OK (finite)")
 
+# ---- pre-bake must cover every sampler/scheduler without fallback ----------
+from h3rt.models import adaln as adaln_mod
+_orig_bake_entry = adaln_mod.bake_adaln_entry
+
+
+def _fail_bake_fallback(*args, **kwargs):
+    raise AssertionError("AdaLN fallback bake should not be needed")
+
+
+adaln_mod.bake_adaln_entry = _fail_bake_fallback
+try:
+    for sampler_name in H3_SAMPLERS:
+        res_no_fallback = h3_sample(
+            handle, cond, latent, None, STEPS, 1.0, sampler_name,
+            SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+            disable_pbar=True, use_adaln_cache=True)
+        assert torch.isfinite(res_no_fallback.video.float()).all()
+        assert torch.isfinite(res_no_fallback.audio.float()).all()
+        print(f"adaln-cache no-fallback sampler {sampler_name} OK")
+    for scheduler_name in H3_SCHEDULERS:
+        res_no_fallback = h3_sample(
+            handle, cond, latent, None, STEPS, 1.0, "euler",
+            SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+            disable_pbar=True, use_adaln_cache=True,
+            scheduler_name=scheduler_name)
+        assert torch.isfinite(res_no_fallback.video.float()).all()
+        assert torch.isfinite(res_no_fallback.audio.float()).all()
+        print(f"adaln-cache no-fallback scheduler {scheduler_name} OK")
+finally:
+    adaln_mod.bake_adaln_entry = _orig_bake_entry
+
 # ---- TeaCache attach/detach -------------------------------------------------
 res_tc = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
                    SHIFT, 1.0, SEED,

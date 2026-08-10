@@ -249,8 +249,14 @@ class Attention(nn.Module):
             q = q.view(1, s, self.heads, self.head_dim)
             k = k.view(1, s, self.heads, self.head_dim)
             rot = rope_freqs.shape[-3] * 2
+            q_norm_weight = self.q_norm.weight
+            k_norm_weight = self.k_norm.weight
+            if q_norm_weight.dtype != q.dtype:
+                q_norm_weight = q_norm_weight.to(q.dtype)
+            if k_norm_weight.dtype != k.dtype:
+                k_norm_weight = k_norm_weight.to(k.dtype)
             q, k = _rms_rope_split_half(q[0], k[0], rope_freqs,
-                                        self.q_norm.weight.to(q.dtype), self.k_norm.weight.to(k.dtype),
+                                        q_norm_weight, k_norm_weight,
                                         self.q_norm.eps, rot)
         else:
             q = self.q_norm(q.view(s, self.heads, self.head_dim))
@@ -312,14 +318,20 @@ class AdalnProj(nn.Module):
 
 
 def _mod_scale_shift(h, shift, scale, segments):
+    if shift.dtype != h.dtype:
+        shift = shift.to(h.dtype)
+    if scale.dtype != h.dtype:
+        scale = scale.to(h.dtype)
     for a, b, row in segments:
-        h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
+        h[a:b].mul_(1.0 + scale[row]).add_(shift[row])
     return h
 
 
 def _mod_gate(x, gate, other, segments):
+    if gate.dtype != x.dtype:
+        gate = gate.to(x.dtype)
     for a, b, row in segments:
-        x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
+        x[a:b].addcmul_(other[a:b], gate[row])
     return x
 
 
@@ -578,16 +590,23 @@ class MiniMaxH3Model(nn.Module):
         for blk in self.token_refiner.blocks:
             blk.attn._backend = fn
 
-    def _precomputed_adaln(self, sigma, unique_t, payload, layout, device, dtype):
+    def _precomputed_adaln(self, sigma, unique_t, payload, layout, device,
+                           dtype, shift_video=None, shift_audio=None):
         if self.adaln_cache is None:
             return None, None
         has_vis = any(kind in ("cond", "ref_img") for _, _, kind in layout.segments)
         has_aud = any(kind == "ref_audio" for _, _, kind in layout.segments)
+        shift_v = float(
+            self.sigma_shift_video if shift_video is None else shift_video)
+        shift_a = float(
+            self.sigma_shift_audio if shift_audio is None else shift_audio)
         key = AdaLNCacheKey(
             sigma=float(sigma),
             unique_timesteps=tuple(float(t) for t in unique_t),
             has_visual_cond=has_vis,
             has_audio_cond=has_aud,
+            shift_video=shift_v,
+            shift_audio=shift_a,
         )
         entry = self.adaln_cache.entries.get(key)
         if entry is None:
@@ -596,6 +615,8 @@ class MiniMaxH3Model(nn.Module):
                     cached_key.has_visual_cond != has_vis
                     or cached_key.has_audio_cond != has_aud
                     or len(cached_key.unique_timesteps) != len(unique_t)
+                    or abs(cached_key.shift_video - shift_v) > 1e-4
+                    or abs(cached_key.shift_audio - shift_a) > 1e-4
                 ):
                     continue
                 if abs(cached_key.sigma - float(sigma)) > 1e-4:
@@ -631,6 +652,45 @@ class MiniMaxH3Model(nn.Module):
         final_mods = self._lora_adaln.apply_to_mods(
             entry.final_mods, self._lora_adaln.final_entries, st)
         return block_mods, final_mods
+
+    @staticmethod
+    def _precomputed_to_gpu(precomputed_blocks, precomputed_final,
+                            device, dtype):
+        """Flatten CPU AdaLN mods and move them with one H2D per step."""
+        if precomputed_blocks is None:
+            return None, None
+        parts = []
+        offsets = [0]
+        counts = []
+        for mods in precomputed_blocks:
+            counts.append(len(mods))
+            parts.extend(mods)
+            offsets.append(
+                offsets[-1]
+                + sum(m.shape[0] for m in mods)
+            )
+        flat = (
+            torch.cat(parts, dim=0).to(device=device, dtype=dtype)
+            if parts else None
+        )
+        blocks = []
+        if flat is not None:
+            for i, count in enumerate(counts):
+                start, end = offsets[i], offsets[i + 1]
+                if count == 0 or end == start:
+                    blocks.append(())
+                else:
+                    blocks.append(tuple(
+                        flat[start:end].chunk(count, dim=0)
+                    ))
+        final = None
+        if precomputed_final:
+            final = tuple(
+                torch.cat(precomputed_final, dim=0).to(
+                    device=device, dtype=dtype
+                ).chunk(len(precomputed_final), dim=0)
+            )
+        return blocks or None, final
 
     # -- text preprocessing ---------------------------------------------------
 
@@ -797,14 +857,17 @@ class MiniMaxH3Model(nn.Module):
         if swap is not None:
             swap.begin()
         precomputed_blocks, precomputed_final = self._precomputed_adaln(
-            sigma_v, unique_t, payload, layout, device, dtype)
+            sigma_v, unique_t, payload, layout, device, dtype,
+            shift_video=shift_v, shift_audio=shift_a)
+        precomputed_blocks, precomputed_final = self._precomputed_to_gpu(
+            precomputed_blocks, precomputed_final, device, dtype)
         if swap is not None:
             for i, block in enumerate(self.blocks):
                 if i % 4 == 0:
                     check_interrupt()
                 swap.prepare(i)
                 block_mods = (
-                    tuple(mod.to(device, dtype) for mod in precomputed_blocks[i])
+                    precomputed_blocks[i]
                     if precomputed_blocks is not None else None
                 )
                 h = block(h, t_emb, mod_segments, rope_freqs,
@@ -816,7 +879,7 @@ class MiniMaxH3Model(nn.Module):
                 if i % 4 == 0:
                     check_interrupt()
                 block_mods = (
-                    tuple(mod.to(device, dtype) for mod in precomputed_blocks[i])
+                    precomputed_blocks[i]
                     if precomputed_blocks is not None else None
                 )
                 h = block(h, t_emb, mod_segments, rope_freqs,
@@ -824,10 +887,7 @@ class MiniMaxH3Model(nn.Module):
 
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
-        final_mods = (
-            tuple(mod.to(device, dtype) for mod in precomputed_final)
-            if precomputed_final is not None else None
-        )
+        final_mods = precomputed_final
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg,
                                 precomputed=final_mods)
 

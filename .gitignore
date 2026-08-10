@@ -5,3 +5,4 @@ __pycache__/
 venv/
 *.log
 node.zip
+trace_h3.json
