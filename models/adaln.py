@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
 
 from ..utils.types import AdaLNCache, AdaLNCacheEntry, AdaLNCacheKey
 from ..utils.stream import BlockReader
@@ -32,6 +35,44 @@ def _bind_linear(reader: BlockReader, key: str, in_features: int,
     else:
         mod.bias = None
     return mod
+
+
+def _add_adaln_lora_delta(adaln_input, out, entries):
+    """Add original 2688-dim AdaLN LoRA as a low-rank output correction."""
+    if not entries:
+        return out
+    out_dtype = out.dtype
+    acc = out.float()
+    from .fold import sum_projected_deltas
+    delta = sum_projected_deltas(entries, adaln_input)
+    if delta is not None:
+        acc = acc + delta.to(device=out.device, dtype=torch.float32)
+    return acc.to(out_dtype)
+
+
+def _fold_adaln_linear(linear: nn.Linear, entries) -> None:
+    """Dequantize if needed, fold AdaLN LoRA entries, and rebind a plain weight."""
+    from .fold import dequantize_and_fold
+    w, orig_dtype = dequantize_and_fold(linear.weight, entries)
+    if orig_dtype is not None:
+        w = w.to(orig_dtype)
+    with torch.no_grad():
+        target_device = (
+            linear.bias.device
+            if linear.bias is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        linear.weight = nn.Parameter(
+            w.to(device=target_device),
+            requires_grad=False,
+        )
+
+
+def _use_adaln_low_rank(entries) -> bool:
+    return not any(
+        e.diff is not None or e.diff_b is not None
+        for e in (entries or [])
+    )
 
 
 def _embed_adaln_input(reader, config, prefix, timesteps, dtype, device):
@@ -100,17 +141,18 @@ def bake_adaln_entry(
                 dtype if config.adaln_curve_grid is None else torch.float32,
                 device,
             )
-            if i in (adaln_entries or {}):
-                from ..models.lora import _fold_entries
-                w = _fold_entries(linear.weight.data, adaln_entries[i])
-                linear.weight.data.copy_(
-                    w.to(dtype=linear.weight.dtype,
-                         device=linear.weight.device))
+            entries = (adaln_entries or {}).get(i)
+            if entries and not _use_adaln_low_rank(entries):
+                _fold_adaln_linear(linear, entries)
             out = linear(adaln_input)
+            if entries and _use_adaln_low_rank(entries):
+                out = _add_adaln_lora_delta(adaln_input, out, entries)
             out = out.view(len(timesteps) * 3, 6 * config.hidden_size)
             chunks = out.chunk(6, dim=-1)
             block_mods.append(tuple(chunk.detach().cpu() for chunk in chunks))
             del linear
+            gc.collect()
+            torch.cuda.empty_cache()
         progress += 1
         if pbar is not None:
             pbar.update_absolute(progress_offset + progress)
@@ -125,13 +167,14 @@ def bake_adaln_entry(
             dtype if config.adaln_curve_grid is None else torch.float32,
             device,
         )
-        if final_adaln_entries:
-            from ..models.lora import _fold_entries
-            w = _fold_entries(linear.weight.data, final_adaln_entries)
-            linear.weight.data.copy_(
-                w.to(dtype=linear.weight.dtype,
-                     device=linear.weight.device))
+        if final_adaln_entries and not _use_adaln_low_rank(
+                final_adaln_entries):
+            _fold_adaln_linear(linear, final_adaln_entries)
         out = linear(adaln_input)
+        if final_adaln_entries and _use_adaln_low_rank(
+                final_adaln_entries):
+            out = _add_adaln_lora_delta(
+                adaln_input, out, final_adaln_entries)
         out = out.view(len(timesteps), 2 * config.hidden_size)
         chunks = out.chunk(2, dim=-1)
         final_mods = tuple(chunk.detach().cpu() for chunk in chunks)
@@ -184,6 +227,8 @@ class AdaLNCachePlanner:
                     unique_timesteps=tuple(float(t) for t in unique),
                     has_visual_cond=has_vis,
                     has_audio_cond=has_aud,
+                    shift_video=self.shift_video,
+                    shift_audio=self.shift_audio,
                 )
                 if key in seen:
                     continue
@@ -196,7 +241,8 @@ class AdaLNCacheBaker:
     """Stream AdaLN weights one block at a time and fill AdaLNCache."""
 
     def __init__(self, reader, config, prefix, dtype, device, pbar=None,
-                 adaln_entries=None, final_adaln_entries=None):
+                 adaln_entries=None, final_adaln_entries=None,
+                 batch_blocks: int = 3):
         self.reader = reader
         self.config = config
         self.prefix = prefix
@@ -205,6 +251,8 @@ class AdaLNCacheBaker:
         self.pbar = pbar
         self.adaln_entries = adaln_entries or {}
         self.final_adaln_entries = final_adaln_entries or []
+        self.batch_blocks = max(1, int(batch_blocks))
+        self.prefetch_batches = max(1, self.batch_blocks - 1)
 
     def bake(self, plans) -> AdaLNCache:
         cache = AdaLNCache()
@@ -240,45 +288,78 @@ class AdaLNCacheBaker:
             else self.dtype
         )
         progress = 0
-        for i in range(self.config.num_layers):
+        def bind_block(i: int):
             key = f"{self.prefix}blocks.{i}.adaln_proj.linear.weight"
-            linear = None
-            if self.reader.has(key):
-                linear = _bind_linear(
-                    self.reader,
-                    key,
-                    self.config.time_embed_dim,
-                    6 * self.config.hidden_size * 3,
-                    linear_dtype,
-                    self.device,
-                )
-            if linear is not None and i in self.adaln_entries:
-                from ..models.lora import _fold_entries
-                w = _fold_entries(
-                    linear.weight.data, self.adaln_entries[i])
-                linear.weight.data.copy_(
-                    w.to(dtype=linear.weight.dtype,
-                         device=linear.weight.device))
-            if linear is not None:
-                out = linear(stacked_input)
-                out = out.view(
-                    stacked_input.shape[0] * 3,
-                    6 * self.config.hidden_size,
-                )
-                plan_outs = torch.split(
-                    out, [size * 3 for size in plan_sizes], dim=0)
-                for plan_key, plan_out in zip(prepared_keys, plan_outs):
-                    block_mods[plan_key][i] = tuple(
-                        chunk.detach().cpu()
-                        for chunk in plan_out.chunk(6, dim=-1)
+            if not self.reader.has(key):
+                return i, None
+            linear = _bind_linear(
+                self.reader,
+                key,
+                self.config.time_embed_dim,
+                6 * self.config.hidden_size * 3,
+                linear_dtype,
+                self.device,
+            )
+            return i, linear
+
+        with ThreadPoolExecutor(max_workers=1,
+                                thread_name_prefix="h3adalnpre") as prefetch:
+            starts = list(range(0, self.config.num_layers, self.batch_blocks))
+            queue = []
+
+            def submit_batch(start_idx):
+                end = min(
+                    self.config.num_layers,
+                    start_idx + self.batch_blocks)
+                return {
+                    prefetch.submit(bind_block, i): i
+                    for i in range(start_idx, end)
+                }
+
+            for batch_idx, start in enumerate(starts):
+                if not queue:
+                    queue.append((start, submit_batch(start)))
+                while (len(queue) <= self.prefetch_batches
+                       and batch_idx + len(queue) < len(starts)):
+                    queue.append((
+                        starts[batch_idx + len(queue)],
+                        submit_batch(starts[batch_idx + len(queue)]),
+                    ))
+                _start, pending = queue.pop(0)
+                linears = {}
+                for fut, i in pending.items():
+                    _i, linear = fut.result()
+                    if linear is not None:
+                        if i in self.adaln_entries and not (
+                                _use_adaln_low_rank(self.adaln_entries[i])):
+                            _fold_adaln_linear(
+                                linear, self.adaln_entries[i])
+                        linears[i] = linear
+
+                for i, linear in linears.items():
+                    out = linear(stacked_input)
+                    if i in self.adaln_entries and _use_adaln_low_rank(
+                            self.adaln_entries[i]):
+                        out = _add_adaln_lora_delta(
+                            stacked_input, out, self.adaln_entries[i])
+                    out = out.view(
+                        stacked_input.shape[0] * 3,
+                        6 * self.config.hidden_size,
                     )
-            else:
-                for plan_key in prepared_keys:
-                    block_mods[plan_key][i] = ()
-            del linear
-            progress += len(prepared)
-            if self.pbar is not None:
-                self.pbar.update_absolute(progress)
+                    plan_outs = torch.split(
+                        out, [size * 3 for size in plan_sizes], dim=0)
+                    for plan_key, plan_out in zip(prepared_keys, plan_outs):
+                        block_mods[plan_key][i] = tuple(
+                            chunk.detach().cpu()
+                            for chunk in plan_out.chunk(6, dim=-1)
+                        )
+                    progress += len(prepared)
+                    if self.pbar is not None:
+                        self.pbar.update_absolute(progress)
+
+                del linears
+                gc.collect()
+                torch.cuda.empty_cache()
 
         final_key = f"{self.prefix}final_layer.adaln_proj.linear.weight"
         linear = None
@@ -291,14 +372,15 @@ class AdaLNCacheBaker:
                 linear_dtype,
                 self.device,
             )
-        if linear is not None and self.final_adaln_entries:
-            from ..models.lora import _fold_entries
-            w = _fold_entries(linear.weight.data, self.final_adaln_entries)
-            linear.weight.data.copy_(
-                w.to(dtype=linear.weight.dtype,
-                     device=linear.weight.device))
+        if linear is not None and self.final_adaln_entries and not (
+                _use_adaln_low_rank(self.final_adaln_entries)):
+            _fold_adaln_linear(linear, self.final_adaln_entries)
         if linear is not None:
             out = linear(stacked_input)
+            if self.final_adaln_entries and _use_adaln_low_rank(
+                    self.final_adaln_entries):
+                out = _add_adaln_lora_delta(
+                    stacked_input, out, self.final_adaln_entries)
             out = out.view(stacked_input.shape[0], 2 * self.config.hidden_size)
             plan_outs = torch.split(out, plan_sizes, dim=0)
             for plan_key, plan_out in zip(prepared_keys, plan_outs):
@@ -312,6 +394,8 @@ class AdaLNCacheBaker:
         progress += len(prepared)
         if self.pbar is not None:
             self.pbar.update_absolute(progress)
+        gc.collect()
+        torch.cuda.empty_cache()
         for key, _ in prepared:
             cache.add(
                 key,

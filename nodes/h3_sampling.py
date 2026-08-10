@@ -18,6 +18,7 @@ changing the packed layout.
 from __future__ import annotations
 
 import math
+import time
 from typing import Optional
 from types import SimpleNamespace
 
@@ -43,6 +44,7 @@ SHIFT_A = 3.0
 
 H3_SAMPLERS = list(comfy.samplers.KSampler.SAMPLERS)
 H3_SCHEDULERS = ["flow_uniform"] + list(comfy.samplers.KSampler.SCHEDULERS)
+ADALN_PREBAKE_UNSUPPORTED = {"dpm_adaptive"}
 
 
 def _h3_native_sampler(model, x, sigmas, extra_args=None, callback=None,
@@ -355,7 +357,26 @@ class _SigmaCaptureModel:
 
     def __call__(self, x, sigma, **kwargs):
         self.captured.append(float(sigma.flatten()[0]))
-        return torch.zeros_like(x)
+        denoised = torch.zeros_like(x)
+        post_fns = kwargs.get("model_options", {}).get(
+            "sampler_post_cfg_function", [])
+        if not post_fns:
+            return denoised
+        for fn in post_fns:
+            args = {
+                "denoised": denoised,
+                "cond": None,
+                "uncond": None,
+                "cond_scale": self.cfg,
+                "model": self,
+                "uncond_denoised": denoised,
+                "cond_denoised": denoised,
+                "sigma": sigma,
+                "model_options": kwargs.get("model_options", {}),
+                "input": x,
+            }
+            denoised = fn(args)
+        return denoised
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +501,8 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
               disable_pbar: bool = False,
               use_adaln_cache: bool = False,
               shift_audio: float = SHIFT_A,
-              scheduler_name: str = "normal") -> H3SampleResult:
+              scheduler_name: str = "normal",
+              adaln_prebake_batch: int = 3) -> H3SampleResult:
     """Run H3 denoising through the official k-diffusion sampler loop.
 
     ``handle`` is the lifecycle ``ModelHandle``; the model is loaded with the
@@ -542,13 +564,17 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
 
     adaln_cache = None
     reader = None
+    prebake_seconds = 0.0
+    if sampler_name in ADALN_PREBAKE_UNSUPPORTED:
+        use_adaln_cache = False
     if use_adaln_cache and total_steps > 0:
+        prebake_start = time.perf_counter()
         samp = comfy.samplers.sampler_object(sampler_name)
         capture = _SigmaCaptureModel(
             _H3ModelSampling(),
             shift_video=shift_video,
             shift_audio=shift_audio)
-        tiny = torch.zeros((1, 16), dtype=torch.float32)
+        tiny = torch.zeros((1, 16), dtype=dtype)
         samp.sample(
             capture,
             sigmas.cpu(),
@@ -559,9 +585,9 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             denoise_mask=None,
             disable_pbar=True,
         )
-        bake_sigmas = sorted(set(capture.captured))
-        if not bake_sigmas:
-            bake_sigmas = [float(s) for s in sigmas[:-1]]
+        bake_sigmas = sorted(
+            set(capture.captured) | {float(s) for s in sigmas}
+        )
 
         reader = BlockReader(handle.model_path)
         try:
@@ -594,8 +620,10 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             baker = AdaLNCacheBaker(
                 reader, config, prefix, dtype, device, pbar=bake_pbar,
                 adaln_entries=adaln_bake_entries,
-                final_adaln_entries=final_bake_entries)
+                final_adaln_entries=final_bake_entries,
+                batch_blocks=adaln_prebake_batch)
             adaln_cache = baker.bake(bake_plans)
+            prebake_seconds = time.perf_counter() - prebake_start
         except Exception:
             reader.close()
             reader = None
@@ -660,6 +688,12 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
         mgr = getattr(model, "_swap_mgr", None)
         base_hits = mgr.swap_hits if mgr is not None else 0
         base_loads = mgr.swap_loads if mgr is not None else 0
+        base_d2h_stage = mgr.stats().get("d2h_stage", 0) if mgr is not None else 0
+        base_d2h_direct = mgr.stats().get("d2h_direct", 0) if mgr is not None else 0
+        base_d2h_host = (
+            mgr.stats().get("d2h_host_register", 0)
+            if mgr is not None else 0)
+        base_d2h_sync = mgr.stats().get("d2h_sync", 0) if mgr is not None else 0
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -697,6 +731,16 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             swap_hits=(mgr.swap_hits - base_hits) if mgr is not None else 0,
             swap_loads=(mgr.swap_loads - base_loads) if mgr is not None else 0,
             peak_vram_mb=peak,
+            d2h_stage=(mgr.stats().get("d2h_stage", 0) - base_d2h_stage)
+            if mgr is not None else 0,
+            d2h_direct=(mgr.stats().get("d2h_direct", 0) - base_d2h_direct)
+            if mgr is not None else 0,
+            d2h_host_register=(
+                mgr.stats().get("d2h_host_register", 0) - base_d2h_host)
+            if mgr is not None else 0,
+            d2h_sync=(mgr.stats().get("d2h_sync", 0) - base_d2h_sync)
+            if mgr is not None else 0,
+            prebake_seconds=prebake_seconds,
         )
     finally:
         if tc is not None:

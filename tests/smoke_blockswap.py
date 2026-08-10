@@ -107,11 +107,10 @@ assert tuple(v_a.shape) == (1, 8, 2, AT)
 v_v2, v_a2 = model.velocity(video, audio, 0.3, text, payload)
 print("2nd step hits/loads:", mgr.swap_hits, mgr.swap_loads)
 
-# pin stage check
-pins = [e.data.is_pinned() for pool in mgr._xfer._pin.slots if pool
-        for e in pool.values()]
-print("pin stage pinned:", all(pins), f"({len(pins)} entries)")
-assert all(pins)
+# global registered home pool check
+registered = mgr._xfer._home_storage_tokens is not None
+print("home pool registered:", registered)
+assert registered
 
 mgr.apply_lora(0, [])
 mgr.clear_lora(0)

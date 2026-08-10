@@ -165,15 +165,19 @@ class MiniMaxH3Conditioning:
                 keyframes.append({"resolved_frame_index": frame_count - 1, "latent": latent})
 
         ref_items = [{"type": "image", "data": img} for img in images] or None
-        text_states, tags = text_encoder.encode(prompt, minimax_ref_items=ref_items)
         if negative_prompt.strip():
-            neg_states, neg_tags = text_encoder.encode(negative_prompt)
+            (text_states, tags), (neg_states, neg_tags) = (
+                text_encoder.encode_pair(
+                    prompt, negative_prompt,
+                    minimax_ref_items=ref_items))
             neg_cond = H3Conditioning(
                 text_states=neg_states,
                 text_token_tags=neg_tags,
                 frame_count=frame_count,
             )
         else:
+            text_states, tags = text_encoder.encode(
+                prompt, minimax_ref_items=ref_items)
             neg_cond = None
 
         cond = H3Conditioning(

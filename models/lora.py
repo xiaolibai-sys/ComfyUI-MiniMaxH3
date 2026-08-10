@@ -28,6 +28,13 @@ from typing import Optional
 
 import torch
 
+from .fold import (
+    _lora_delta,
+    dequantize_and_fold,
+    dequantize_weight,
+    fold_entries as _fold_entries,
+    project_lora_delta,
+)
 from ..utils.types import AdaLNOverride, H3Lora, LoraEntry, SlotEntry
 
 logger = logging.getLogger("h3.lora")
@@ -105,112 +112,6 @@ def standardize_lora_keys(lora_sd: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Merge math (BerniniRWrapper parity)
-# ---------------------------------------------------------------------------
-
-def _lora_delta(A: torch.Tensor, B: torch.Tensor, alpha, strength: float,
-                base_shape=None):
-    """``strength * (alpha/rank) * delta`` in float32, both orientations.
-
-    Diffusers: ``lora_A=[rank,in]``, ``lora_B=[out,rank]`` -> ``B @ A``.
-    Kohya: ``lora_down=[in,rank]`` (A), ``lora_up=[rank,out]`` (B) -> ``(A @ B).T``.
-    ``base_shape`` validates the orientation for square matrices.
-    """
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
-    if base_shape is not None and len(base_shape) == 2:
-        out, in_ = int(base_shape[0]), int(base_shape[1])
-        if B.shape[1] == A.shape[0] and (B @ A).shape == (out, in_):
-            delta, rank = B @ A, A.shape[0]
-        elif A.shape[1] == B.shape[0] and (A @ B).T.shape == (out, in_):
-            delta, rank = (A @ B).T, A.shape[1]
-        else:
-            delta, rank = B @ A, A.shape[0]
-    else:
-        if A.shape[1] == B.shape[0]:
-            delta, rank = (A @ B).T, A.shape[1]
-        else:
-            delta, rank = B @ A, A.shape[0]
-    if alpha is not None:
-        try:
-            alpha_val = float(alpha.item() if alpha.numel() == 1 else alpha)
-        except Exception:
-            alpha_val = float(rank)
-    else:
-        alpha_val = float(rank)
-    return delta * (strength * (alpha_val / rank)), rank
-
-
-def _chunk_add_delta(w: torch.Tensor, entry, chunk_rows: int = 8192) -> None:
-    """Add one LoRA delta in row chunks on w.device."""
-    if entry.a is None or entry.b is None:
-        return
-    A = entry.a.to(device=w.device, dtype=torch.float32)
-    n_rows = w.shape[0]
-    for start in range(0, n_rows, chunk_rows):
-        end = min(start + chunk_rows, n_rows)
-        rows = slice(start, end)
-        B = entry.b[rows].to(device=w.device, dtype=torch.float32)
-        d, _ = _lora_delta(A, B, entry.alpha, entry.strength,
-                           (end - start, w.shape[1]))
-        w[rows] += d
-
-
-def _fold_entries_chunked(w: torch.Tensor, entries: list,
-                          chunk_rows: int = 8192) -> torch.Tensor:
-    """Chunked standard LoRA fold to avoid materialising huge B@A deltas."""
-    for e in entries:
-        _chunk_add_delta(w, e, chunk_rows)
-    return w
-
-
-def _fold_entries_dora_chunked(w: torch.Tensor, entries: list,
-                               chunk_rows: int = 8192) -> torch.Tensor:
-    """Chunked DoRA fold: row norms on GPU, deltas added per row chunk."""
-    for e in entries:
-        if e.diff_b is not None:
-            before_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            _chunk_add_delta(w, e, chunk_rows)
-            after_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            diff_b = e.diff_b.to(device=w.device, dtype=w.dtype)
-            m = (before_norm + diff_b.float().reshape(-1, 1)).clamp(min=0.0)
-            w = m * w / after_norm
-        else:
-            _chunk_add_delta(w, e, chunk_rows)
-    return w
-
-
-def _fold_entries(w: torch.Tensor, entries: list) -> torch.Tensor:
-    """LoRA + DoRA standardisation on one weight tensor (fp32).
-
-    Multiple DoRA entries are applied sequentially in list order. Each DoRA
-    step renormalises against the current weight before adding its LoRA delta,
-    which keeps multiple adapters well-defined.
-    """
-    w = w.float()
-    if w.dim() == 2:
-        if any(e.diff_b is not None for e in entries):
-            return _fold_entries_dora_chunked(w, entries)
-        if not any(e.diff is not None for e in entries):
-            return _fold_entries_chunked(w, entries)
-    for e in entries:
-        before_norm = None
-        if e.diff_b is not None and w.dim() == 2:
-            before_norm = w.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        if e.a is not None and e.b is not None:
-            d, _ = _lora_delta(e.a, e.b, e.alpha, e.strength, w.shape)
-            w = w + d.to(device=w.device, dtype=w.dtype)
-        if before_norm is not None:
-            diff_b = e.diff_b.to(device=w.device, dtype=w.dtype)
-            m = (before_norm + diff_b.float().reshape(-1, 1)).clamp(min=0.0)
-            w = m * w / w.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    diff = next((e.diff for e in entries if e.diff is not None), None)
-    if diff is not None and w.dim() == 1:
-        w = w + diff.to(device=w.device, dtype=w.dtype).float()
-    return w
-
-
-# ---------------------------------------------------------------------------
 # Slot folding
 # ---------------------------------------------------------------------------
 
@@ -283,13 +184,13 @@ def fold_lora_into_slot(block, slot: dict) -> None:
             # fold on the DEQUANTISED weight, then requantise with a fresh
             # scale (folding on raw int8 qdata would corrupt the result)
             qt = entry.to_quantized_tensor()
-            w = qt.dequantize().float()
-            if qkv_idx is not None:
-                sl = _row_slice()
-                w[sl] = _fold_entries(w[sl], entries)
-            else:
-                w = _fold_entries(w, entries)
             try:
+                if qkv_idx is not None:
+                    w, _ = dequantize_weight(qt)
+                    sl = _row_slice()
+                    w[sl] = _fold_entries(w[sl], entries)
+                else:
+                    w, _ = dequantize_and_fold(qt, entries)
                 new_qt = qt.requantize_from_float(w.to(qt.dtype), scale="recalculate")
                 entry.data.copy_(new_qt._qdata)
                 entry.scale.copy_(new_qt._params.scale)
@@ -301,6 +202,10 @@ def fold_lora_into_slot(block, slot: dict) -> None:
                         entry.extra[f].copy_(v)
             except Exception:
                 logger.warning("quantized LoRA fold for %s failed (convrot?) - left unmerged", key)
+            finally:
+                del qt, w
+                if "new_qt" in locals():
+                    del new_qt
         else:
             w = entry.data.float()
             if qkv_idx is not None:
@@ -527,18 +432,8 @@ class AdalnLoraState:
             return None
         a = self._move(entry.a, st.device, torch.float32)
         b = self._move(entry.b, st.device, torch.float32)
-        st = st.to(torch.float32)
-        rank = a.shape[0]
-        alpha = entry.alpha
-        if alpha is None:
-            alpha_val = float(rank)
-        else:
-            try:
-                alpha_val = float(alpha.item() if alpha.numel() == 1 else alpha)
-            except Exception:
-                alpha_val = float(rank)
-        delta = (b @ (a @ st.T)).T
-        return delta * (entry.strength * (alpha_val / rank))
+        return project_lora_delta(
+            a, b, entry.alpha, entry.strength, st)
 
     def apply_to_mods(self, mods, entries: Optional[list[LoraEntry]],
                       st: torch.Tensor):

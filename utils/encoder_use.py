@@ -119,6 +119,39 @@ class TextEncoderHandle:
                 tags = self._tags_from_mm(payload, states.shape[1])
         return states, tags.to(states.device)
 
+    @torch.inference_mode()
+    def encode_pair(self, prompt: str, negative_prompt: str,
+                    max_length: int = 4096,
+                    minimax_ref_items=None):
+        """Encode positive and negative text while sharing streamed groups."""
+        enc = self._enc
+        if enc is None or getattr(enc, "_destroyed", False):
+            enc = self.load()
+        from ..models.text_encoder.types import TextEncoderInput
+        pos = TextEncoderInput(
+            text=prompt, max_length=max_length,
+            minimax_ref_items=minimax_ref_items)
+        neg = TextEncoderInput(text=negative_prompt, max_length=max_length)
+        out_pos, out_neg = enc.encode_many([pos, neg])
+        states_pos = out_pos.last_hidden_state
+        states_neg = out_neg.last_hidden_state
+        tags_pos = (
+            out_pos.token_tags.to(states_pos.device)
+            if out_pos.token_tags is not None
+            else torch.ones(1, states_pos.shape[1], dtype=torch.long)
+        )
+        tags_neg = (
+            out_neg.token_tags.to(states_neg.device)
+            if out_neg.token_tags is not None
+            else torch.ones(1, states_neg.shape[1], dtype=torch.long)
+        )
+        return (states_pos, tags_pos), (states_neg, tags_neg)
+
+    def release_groups(self):
+        enc = self._enc
+        if enc is not None and not getattr(enc, "_destroyed", False):
+            enc.streamer.release_all()
+
     def _tags_from_mm(self, payload, seq_len: int) -> torch.Tensor:
         # v1 heuristic: if the encoder cannot report vision spans, default all
         # text; the DiT still runs (slightly off modality tags for vision pads).
