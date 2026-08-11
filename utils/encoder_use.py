@@ -10,6 +10,7 @@ ComfyUI PR's ``layer_norm_hidden_state=False``), and returns
 
 from __future__ import annotations
 
+import gc
 import threading
 from typing import Optional
 
@@ -166,3 +167,13 @@ def unload_all_encoders() -> None:
             except Exception:
                 pass
         _encoder_cache.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass

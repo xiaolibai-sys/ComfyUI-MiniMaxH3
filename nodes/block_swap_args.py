@@ -26,6 +26,9 @@ class MiniMaxH3BlockSwapArgs:
                     "tooltip": "Use pinned memory for staging/prefetch transfers; the home pool stays pageable."}),
                 "disk_workers": ("INT", {"default": 2, "min": 1, "max": 16,
                     "tooltip": "Number of background disk read threads."}),
+                "auto_vram": ("BOOLEAN", {"default": True,
+                    "tooltip": "Automatically reserve estimated activation/ComfyUI VRAM and runtime LoRA before allocating the block pool. "
+                               "Disable to use the block_to_swap/hot_blocks/prefetch_count values exactly as configured."}),
                 "dtype": (["bfloat16", "float16", "float32"], {"default": "bfloat16",
                     "tooltip": "DiT compute/storage dtype: bfloat16 recommended, float16 for older GPUs, float32 for debugging."}),
             },
@@ -36,8 +39,8 @@ class MiniMaxH3BlockSwapArgs:
     FUNCTION = "build"
     CATEGORY = "MiniMax-H3/sampling"
 
-    def build(self, block_to_swap, hot_blocks, prefetch, prefetch_count, pin_memory, disk_workers, dtype):
+    def build(self, block_to_swap, hot_blocks, prefetch, prefetch_count, pin_memory, disk_workers, auto_vram, dtype):
         return (H3BlockSwap(enabled=True, block_to_swap=block_to_swap, hot_blocks=hot_blocks,
                             prefetch=prefetch,
                             prefetch_count=prefetch_count, pin_memory=pin_memory,
-                            disk_workers=disk_workers, dtype=dtype),)
+                            disk_workers=disk_workers, auto_vram=auto_vram, dtype=dtype),)

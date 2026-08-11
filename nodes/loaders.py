@@ -51,7 +51,11 @@ class MiniMaxH3Loader:
     def load(self, model_name, attn_backend=None):
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         override = attn_backend.make_override() if attn_backend is not None else None
-        return (load_model_handle(model_path=model_path, attn_backend=override),)
+        handle = load_model_handle(model_path=model_path, attn_backend=override)
+        handle.attn_backend_name = (
+            attn_backend.backend if attn_backend is not None else "sageattn2"
+        )
+        return (handle,)
 
 
 class MiniMaxH3VAELoader:

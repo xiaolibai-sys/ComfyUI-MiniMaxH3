@@ -671,6 +671,8 @@ class TextEncoder:
                 for name in list(mod._parameters.keys()):
                     mod._parameters[name] = nn.Parameter(torch.empty(0),
                                                          requires_grad=False)
+                for name in list(mod._buffers.keys()):
+                    mod._buffers[name] = torch.empty(0)
         if self.vision_model is not None:
             for mod in self.vision_model.modules():
                 for name in list(mod._parameters.keys()):

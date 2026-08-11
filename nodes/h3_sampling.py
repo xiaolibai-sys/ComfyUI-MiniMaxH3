@@ -517,6 +517,7 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
     from ..utils.encoder_use import unload_all_encoders
     unload_all_vaes()
     unload_all_encoders()
+    collect_garbage()
 
     device = handle.load_device
     dtype = (injection.swap or handle.swap).torch_dtype
@@ -549,6 +550,12 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             frame_count=neg_payload.get("frame_count"),
         )
         neg_payload["layout"] = neg_layout
+
+    from ..utils.vram_models import make_static_reserved_swap
+    backend = getattr(handle, "attn_backend_name", "sageattn2")
+    injection.swap = make_static_reserved_swap(
+        injection.swap, backend, text_len, latent, payload,
+        cfg=cfg, loras=handle.loras)
 
     if denoise <= 0.0:
         return H3SampleResult(video=latent.video, audio=latent.audio,
@@ -628,6 +635,7 @@ def h3_sample(handle, conditioning: H3Conditioning, latent: AVLatent,
             reader.close()
             reader = None
             raise
+        collect_garbage()
 
     try:
         model = handle.load(swap_config=injection.swap,

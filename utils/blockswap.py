@@ -46,6 +46,11 @@ def _align_offset(offset: int, alignment: int) -> int:
     return (offset + alignment - 1) // alignment * alignment
 
 
+_POOL_COMPONENT_ALIGNMENT = 128
+# cuBLASLt NVFP4 GEMM requires aligned scale/qdata pointers; keeping every
+# component 128-byte aligned also makes the CPU/GPU pool layouts identical.
+
+
 def _home_slot_layout(block: SwapBlock):
     """Return (plan, total_bytes) for one block-shaped home slot."""
     plan: list[tuple[str, list[tuple[str, torch.dtype, tuple]]]] = []
@@ -60,8 +65,8 @@ def _home_slot_layout(block: SwapBlock):
         plan.append((name, comps))
         for _kind, dtype, shape in comps:
             nbytes = int(torch.tensor(shape, dtype=torch.int64).prod()) * dtype.itemsize
-            total = _align_offset(total, dtype.itemsize) + nbytes
-    return plan, total
+            total = _align_offset(total, _POOL_COMPONENT_ALIGNMENT) + nbytes
+    return plan, _align_offset(total, _POOL_COMPONENT_ALIGNMENT)
 
 
 def _build_contiguous_home_slot(block: SwapBlock):
@@ -91,7 +96,7 @@ def _home_slot_views(block: SwapBlock, raw: torch.Tensor, base: int):
         extras = {}
         for kind, dtype, shape in comps:
             nbytes = int(torch.tensor(shape, dtype=torch.int64).prod()) * dtype.itemsize
-            offset = _align_offset(offset, dtype.itemsize)
+            offset = _align_offset(offset, _POOL_COMPONENT_ALIGNMENT)
             view = raw[base + offset:base + offset + nbytes].view(dtype).reshape(shape)
             offset += nbytes
             if kind == "data":
@@ -732,6 +737,9 @@ class BlockSwapManager:
                  window_size: int = 2, prefetch: bool = True,
                  prefetch_count: int = 2, pin_memory: bool = True,
                  disk_workers: int = 2, hot_blocks: int = 0,
+                 vram_reserve_mb: float = 0.0,
+                 runtime_lora_total_mb: float = 0.0,
+                 runtime_lora_fixed_mb: float = 0.0,
                  dtype=torch.bfloat16):
         self.blocks = blocks
         self.total = len(blocks)
@@ -744,6 +752,48 @@ class BlockSwapManager:
         self.swap_loads = 0
         self.home_size = max(0, self.total - self.window_size)
         self._flushed_this_step = False
+
+        block_mb = (blocks[0].bytes_per_block() / 2 ** 20) if blocks else 0.0
+        if vram_reserve_mb > 0 and block_mb > 0:
+            lora_per_slot_mb = (
+                runtime_lora_total_mb / self.total
+                if self.total > 0 else 0.0
+            )
+            effective_reserve_mb = vram_reserve_mb + runtime_lora_fixed_mb
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            free_mb = _VRAMBudget(block_mb).free_mb(self.device)
+            max_slots = max(
+                1,
+                int((free_mb - effective_reserve_mb)
+                    // (block_mb + lora_per_slot_mb)),
+            )
+            requested = self.window_size + self.prefetch_count
+            if requested > max_slots:
+                self.prefetch_count = min(
+                    self.prefetch_count, max(0, max_slots - 1))
+                self.window_size = max(
+                    1,
+                    min(self.window_size, max_slots - self.prefetch_count),
+                )
+                hot_blocks = min(
+                    hot_blocks, max(0, self.window_size - 1))
+                self.home_size = max(0, self.total - self.window_size)
+                logger.info(
+                    "blockswap: free VRAM %.0f MB after flush, "
+                    "static VRAM reserve %.0f MB "
+                    "(lora total %.1f fixed %.1f) -> "
+                    "window=%d prefetch=%d hot=%d",
+                    free_mb, effective_reserve_mb, runtime_lora_total_mb,
+                    runtime_lora_fixed_mb, self.window_size,
+                    self.prefetch_count, hot_blocks)
 
         self.hot_blocks = max(0, min(hot_blocks, self.total))
         self._window = _BlockWindow(

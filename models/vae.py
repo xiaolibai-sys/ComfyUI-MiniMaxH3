@@ -16,6 +16,7 @@ the audio VAE is a DAC-style encoder + BigVGAN decoder at 32 kHz.
 
 from __future__ import annotations
 
+import gc
 import math
 
 import torch
@@ -1321,3 +1322,13 @@ def unload_all_vaes() -> None:
     for pack in _vae_cache.values():
         pack.unload()
     _vae_cache.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass

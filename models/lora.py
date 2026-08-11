@@ -184,6 +184,7 @@ def fold_lora_into_slot(block, slot: dict) -> None:
             # fold on the DEQUANTISED weight, then requantise with a fresh
             # scale (folding on raw int8 qdata would corrupt the result)
             qt = entry.to_quantized_tensor()
+            w = None
             try:
                 if qkv_idx is not None:
                     w, _ = dequantize_weight(qt)
@@ -203,7 +204,9 @@ def fold_lora_into_slot(block, slot: dict) -> None:
             except Exception:
                 logger.warning("quantized LoRA fold for %s failed (convrot?) - left unmerged", key)
             finally:
-                del qt, w
+                del qt
+                if w is not None:
+                    del w
                 if "new_qt" in locals():
                     del new_qt
         else:

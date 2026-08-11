@@ -93,6 +93,10 @@ class H3BlockSwap:
     prefetch_count: int = 2             # home slots read ahead from disk
     pin_memory: bool = True             # pinned CPU staging; only the small prefetch/stage pools are pinned (home stays pageable), so the locked footprint is tiny and Windows-safe
     disk_workers: int = 2               # background reader threads
+    auto_vram: bool = True              # estimate reserve/runtime LoRA before pool allocation
+    vram_reserve_mb: float = 0.0        # non-weight VRAM reserved before block pool allocation
+    runtime_lora_total_mb: float = 0.0  # runtime LoRA A/B bytes shared across all 50 blocks
+    runtime_lora_fixed_mb: float = 0.0  # AdaLN/final/token-refiner runtime LoRA fixed bytes
     loading_mode: str = LoadingMode.STREAMING.value
     dtype: str = "bfloat16"             # bfloat16 | float16 | float32
 
