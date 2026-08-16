@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 from .reference_roles import reference_role_text
+from .fl_prompt import FL_ROLLING_SYSTEM_PROMPT, FL_SEGMENT_OUTPUT_INSTRUCTION
 from .prompt_refiner import (
     _OFFICIAL_FORMAT_CONTRACT,
     _SYSTEM_PROMPT,
@@ -628,6 +629,7 @@ def _chat_user_text(
     total_duration: float | None = None,
     ratio: str = "",
     subjects=None,
+    note: str = "",
 ) -> str:
     parts = []
     if instruction.strip():
@@ -666,7 +668,242 @@ def _chat_user_text(
     parts.append(prompt.strip())
     if music_style.strip():
         parts.append(f"Non-diegetic music requirement: {music_style.strip()}")
+    if note.strip():
+        parts.append(f"Additional context note: {note.strip()}")
     return "\n\n".join(parts)
+
+
+_ROLLING_OPENAI_SYSTEM = FL_ROLLING_SYSTEM_PROMPT
+
+_ROLLING_SEGMENT_RE = re.compile(
+    r"\[SEGMENT\s+(\d+)\]\s*(.*?)(?=\[SEGMENT\s+\d+\]|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _rolling_segment_text(segment) -> str:
+    start_state = "provided" if segment.get("start_image_exists") else "missing"
+    end_state = "provided" if segment.get("end_image_exists") else "missing"
+    lines = [
+        f"Segment {segment.get('index')}:",
+        (
+            f"start keyframe {segment.get('start_keyframe_index')}, "
+            f"time {float(segment.get('start_time') or 0.0):.3f}s, "
+            f"frame {segment.get('start_frame')}, image {start_state}"
+        ),
+        (
+            f"end keyframe {segment.get('end_keyframe_index')}, "
+            f"time {float(segment.get('end_time') or 0.0):.3f}s, "
+            f"frame {segment.get('end_frame')}, image {end_state}"
+        ),
+    ]
+    if segment.get("start_image_note"):
+        lines.append(f"start image note: {segment['start_image_note']}")
+    if segment.get("end_image_note"):
+        lines.append(f"end image note: {segment['end_image_note']}")
+    if segment.get("prompt"):
+        lines.append(f"source prompt: {segment['prompt']}")
+    if segment.get("negative_prompt"):
+        lines.append(f"source negative prompt: {segment['negative_prompt']}")
+    return "\n".join(lines)
+
+
+def _rolling_chat_content(
+    prompt: str,
+    instruction: str,
+    music_style: str,
+    output_mode: str,
+    ratio: str,
+    rolling_segments,
+    global_negative_prompt: str,
+    base_negative_prompt: str,
+    supports_image: bool,
+) -> list:
+    parts = []
+    if instruction.strip():
+        parts.append(f"User requirement: {instruction.strip()}")
+    if output_mode and output_mode not in ("auto", "T2VA"):
+        parts.append(f"Output mode: {output_mode}")
+    if ratio:
+        parts.append(f"Aspect ratio: {ratio}")
+    if prompt.strip():
+        parts.append(f"Global source prompt: {prompt.strip()}")
+    if base_negative_prompt.strip():
+        parts.append(f"Global source negative prompt: {base_negative_prompt.strip()}")
+    if music_style.strip():
+        parts.append(f"Non-diegetic music requirement: {music_style.strip()}")
+
+    content = [{"type": "text", "text": "\n\n".join(parts)}]
+    for segment in rolling_segments:
+        segment_text = _rolling_segment_text(segment)
+        if supports_image:
+            segment_text += "\nImage inputs for this segment follow this text."
+        content.append({"type": "text", "text": segment_text})
+        if supports_image:
+            if segment.get("start_image") is not None:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": _image_tensor_uri(segment["start_image"])},
+                })
+            if segment.get("end_image") is not None:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": _image_tensor_uri(segment["end_image"])},
+                })
+
+    footer = []
+    if global_negative_prompt.strip():
+        footer.append(f"Global negative prompt: {global_negative_prompt.strip()}")
+    footer.append(
+        FL_SEGMENT_OUTPUT_INSTRUCTION.format(count=len(rolling_segments))
+    )
+    content.append({"type": "text", "text": "\n\n".join(footer)})
+    return content
+
+
+def _parse_rolling_prompts(content: str, count: int, originals: list[str]) -> list[str]:
+    text = str(content or "").strip()
+    text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
+    matches = _ROLLING_SEGMENT_RE.findall(text)
+    parsed = {}
+    for index_text, value in matches:
+        try:
+            index = int(index_text) - 1
+        except ValueError:
+            continue
+        if 0 <= index < count:
+            parsed[index] = value.strip()
+    refined = list(originals[:count])
+    for index in range(count):
+        if parsed.get(index):
+            refined[index] = parsed[index]
+    if not matches and count == 1 and text:
+        refined[0] = text
+    return refined
+
+
+def polish_with_openai_compatible_rolling(
+    *,
+    prompt: str,
+    base_url: str,
+    model: str,
+    instruction: str = "",
+    music_style: str = "",
+    rolling_segments: list,
+    global_negative_prompt: str = "",
+    base_negative_prompt: str = "",
+    output_mode: str = "FL2VA",
+    ratio: str = "adaptive",
+    supports_image: bool = False,
+    supports_video: bool = False,
+    supports_audio: bool = False,
+    api_key_env: str = "",
+    reasoning: str = "auto",
+    reasoning_effort: str = "auto",
+    extra_body_json: str = "",
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    max_tokens: int = 0,
+    timeout: float = 120.0,
+) -> tuple[list[str], list[str]]:
+    if not model.strip():
+        raise ValueError("OpenAI-compatible Refiner: model is required.")
+    if timeout <= 0:
+        raise ValueError("OpenAI-compatible Refiner: timeout must be positive.")
+    if not rolling_segments:
+        return [], []
+
+    api_key = (
+        _api_key(api_key_env, "OpenAI-compatible Refiner")
+        if api_key_env.strip()
+        else ""
+    )
+    user_content = _rolling_chat_content(
+        prompt,
+        instruction,
+        music_style,
+        output_mode,
+        ratio,
+        rolling_segments,
+        global_negative_prompt,
+        base_negative_prompt,
+        supports_image,
+    )
+    payload = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": _ROLLING_OPENAI_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": temperature,
+        "top_p": top_p,
+        "stream": False,
+    }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    if reasoning != "auto":
+        payload["thinking"] = {"type": reasoning}
+    if reasoning_effort != "auto":
+        payload["reasoning_effort"] = reasoning_effort
+    if extra_body_json.strip():
+        try:
+            extra = json.loads(extra_body_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"OpenAI-compatible Refiner: extra_body_json is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(extra, dict):
+            raise ValueError(
+                "OpenAI-compatible Refiner: extra_body_json must be a JSON object."
+            )
+        payload.update(extra)
+
+    print(
+        "[MiniMax H3 OpenAI Rolling Refiner] request "
+        f"base_url={base_url} model={model} segments={len(rolling_segments)} "
+        f"supports_image={supports_image}",
+        flush=True,
+    )
+    data = _chat_request_json(
+        _normalize_chat_url(base_url),
+        api_key,
+        payload,
+        timeout,
+    )
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            f"OpenAI-compatible Refiner: unexpected response: {data}"
+        ) from exc
+    if isinstance(content, list):
+        content = "".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict)
+        )
+    if not content:
+        raise RuntimeError(
+            "OpenAI-compatible Refiner returned an empty prompt; "
+            f"raw response: {data}"
+        )
+
+    originals = [
+        str(segment.get("prompt") or "").strip()
+        for segment in rolling_segments
+    ]
+    refined = _parse_rolling_prompts(content, len(rolling_segments), originals)
+    negatives = []
+    for segment in rolling_segments:
+        segment_negative = str(segment.get("negative_prompt") or "").strip()
+        base_negative = str(base_negative_prompt or "").strip()
+        global_negative = str(global_negative_prompt or "").strip()
+        negative = "\n".join(
+            part for part in (segment_negative, base_negative, global_negative)
+            if part
+        )
+        negatives.append(negative)
+    return refined, negatives
 
 
 def polish_with_openai_compatible(
@@ -694,6 +931,7 @@ def polish_with_openai_compatible(
     top_p: float = 0.95,
     max_tokens: int = 0,
     timeout: float = 120.0,
+    note: str = "",
 ) -> str:
     if not prompt.strip():
         return prompt
@@ -716,6 +954,7 @@ def polish_with_openai_compatible(
         total_duration=total_duration,
         ratio=ratio,
         subjects=subjects,
+        note=note,
     )
     media, media_guide = _chat_media_payload(
         package,

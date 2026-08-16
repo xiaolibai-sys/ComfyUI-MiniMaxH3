@@ -331,14 +331,13 @@ style.textContent = `
 }
 .mmh3-sb-chipbar {
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mmh3-sb-chiprow {
+  display: flex;
   flex-wrap: wrap;
   gap: 5px;
-  align-items: center;
-}
-.mmh3-sb-chipbar-label {
-  font-size: 10px;
-  color: var(--sb-dim);
-  margin-right: 2px;
 }
 .mmh3-sb-chip {
   display: inline-flex;
@@ -374,7 +373,7 @@ style.textContent = `
 }
 .mmh3-sb-fields {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 .mmh3-sb-fcol {
@@ -389,9 +388,11 @@ style.textContent = `
   font-weight: 700;
   letter-spacing: 0.3px;
 }
-.mmh3-sb-fcol input {
-  height: 28px;
+.mmh3-sb-fcol textarea {
   width: 100%;
+  min-height: 34px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 .mmh3-sb-empty {
   flex: 1;
@@ -527,9 +528,6 @@ style.textContent = `
   font-size: 11px;
   width: 100%;
 }
-.mmh3-sb-gfield input {
-  height: 28px;
-}
 
 /* compact layout for narrow nodes */
 .mmh3-sb-root.compact .mmh3-sb-main {
@@ -544,9 +542,6 @@ style.textContent = `
   width: 100%;
   flex: none;
   max-height: 260px;
-}
-.mmh3-sb-root.compact .mmh3-sb-fields {
-  grid-template-columns: 1fr;
 }
 
 /* preview */
@@ -1010,9 +1005,10 @@ function setupStoryboard(node) {
 
   let data = parseStoryboard(node.properties.storyboard_data);
   let selectedShot = 0;
-  let mediaSourceNodeId = null;
+  let mediaSourceNodeId = node.properties.mmh3_media_source || null;
   let mediaLabels = { images: [], videos: [], audios: [] };
   let syncTimer = null;
+  let insertTarget = null;
 
   /* ---------- skeleton ---------- */
   const root = el("div", "mmh3-sb-root");
@@ -1081,7 +1077,11 @@ function setupStoryboard(node) {
   const subjectsPane = el("div", "mmh3-sb-pane");
   const mediaRow = el("div", "mmh3-sb-media-row", "Media source");
   const mediaSourceSelect = document.createElement("select");
-  mediaRow.append(mediaSourceSelect);
+  const mediaRefreshBtn = el("button", "mmh3-sb-icon");
+  mediaRefreshBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>';
+  mediaRefreshBtn.title = "Refresh media labels";
+  mediaRefreshBtn.style.flex = "none";
+  mediaRow.append(mediaSourceSelect, mediaRefreshBtn);
   const mediaNone = el("div", "mmh3-sb-media-none", "No PackageData node in this graph.");
   const subjectList = el("div");
   subjectList.style.cssText = "display:flex;flex-direction:column;gap:8px;";
@@ -1101,7 +1101,7 @@ function setupStoryboard(node) {
   soundField.append(soundInput);
   const musicField = el("div", "mmh3-sb-gfield");
   musicField.append(el("label", "", "NON-DIEGETIC MUSIC"));
-  const musicInput = document.createElement("input");
+  const musicInput = document.createElement("textarea");
   musicInput.placeholder = "melancholic piano";
   musicField.append(musicInput);
   globalPane.append(negField, soundField, musicField);
@@ -1125,6 +1125,13 @@ function setupStoryboard(node) {
   previewBar.append(previewToggle, previewBody);
 
   root.append(header, timeline, main, previewBar);
+
+  /* chips always insert into the last focused text field of this node */
+  root.addEventListener("focusin", (event) => {
+    if (event.target?.__mmh3InsertApply) {
+      insertTarget = { el: event.target, apply: event.target.__mmh3InsertApply };
+    }
+  });
 
   /* ---------- state helpers ---------- */
   const shotStarts = () => {
@@ -1286,48 +1293,82 @@ function setupStoryboard(node) {
     deleteShot.disabled = data.shots.length <= 1;
     head.append(durField, moveLeft, moveRight, deleteShot);
 
-    const chipbar = el("div", "mmh3-sb-chipbar");
-    chipbar.append(el("span", "mmh3-sb-chipbar-label", "Insert:"));
     const chips = [
-      ...mediaLabels.images.map((label) => makeChip(label, "k-picture")),
-      ...mediaLabels.videos.map((label) => makeChip(label, "k-video")),
-      ...mediaLabels.audios.map((label) => makeChip(label, "k-audio")),
+      ...mediaLabels.images.map((label) => makeChip(label, "k-picture", "", label.replace(/[<>]/g, ""))),
+      ...mediaLabels.videos.map((label) => makeChip(label, "k-video", "", label.replace(/[<>]/g, ""))),
+      ...mediaLabels.audios.map((label) => makeChip(label, "k-audio", "", label.replace(/[<>]/g, ""))),
       ...data.subjects
         .map((subject, subjectIndex) => ({ subject, subjectIndex }))
         .filter(({ subject }) => subject.name || subject.definition)
         .map(({ subject, subjectIndex }) => makeChip(
-          subject.label || `<Subject ${subjectIndex + 1}>`,
+          subject.name || subject.label || `<Subject ${subjectIndex + 1}>`,
           "",
           SUBJECT_COLORS[subjectIndex % SUBJECT_COLORS.length],
           subject.name || subject.label || `<Subject ${subjectIndex + 1}>`,
         )),
     ];
-    chips.forEach((chip) => chipbar.append(chip));
+    const chipbar = el("div", "mmh3-sb-chipbar");
+    [
+      chips.filter((chip) =>
+        !chip.classList.contains("k-picture")
+        && !chip.classList.contains("k-video")
+        && !chip.classList.contains("k-audio")),
+      chips.filter((chip) => chip.classList.contains("k-picture")),
+      chips.filter((chip) => chip.classList.contains("k-video")),
+      chips.filter((chip) => chip.classList.contains("k-audio")),
+    ].filter((groupChips) => groupChips.length)
+      .forEach((groupChips) => {
+        const row = el("div", "mmh3-sb-chiprow");
+        groupChips.forEach((chip) => row.append(chip));
+        chipbar.append(row);
+      });
 
     const prompt = document.createElement("textarea");
     prompt.className = "mmh3-sb-prompt";
     prompt.placeholder = "Describe what happens in this shot…";
     prompt.value = shot.prompt || "";
+    prompt.__mmh3InsertApply = (value) => {
+      shot.prompt = value;
+      persist();
+      renderTrack();
+      renderTotal();
+      updatePreview();
+    };
 
     const fields = el("div", "mmh3-sb-fields");
     const cameraCol = el("div", "mmh3-sb-fcol");
     cameraCol.append(el("label", "", "CAMERA"));
-    const cameraInput = document.createElement("input");
+    const cameraInput = document.createElement("textarea");
     cameraInput.placeholder = "e.g. slow dolly-in";
     cameraInput.value = shot.camera || "";
     cameraCol.append(cameraInput);
+    cameraInput.__mmh3InsertApply = (value) => {
+      shot.camera = value;
+      persist();
+      updatePreview();
+    };
     const dialogueCol = el("div", "mmh3-sb-fcol");
     dialogueCol.append(el("label", "", "DIALOGUE"));
-    const dialogueInput = document.createElement("input");
-    dialogueInput.placeholder = "<d>[tone] line</d>";
+    const dialogueInput = document.createElement("textarea");
+    dialogueInput.placeholder = "Lena says: <d>[Chinese] your line</d>";
     dialogueInput.value = shot.dialogue || "";
     dialogueCol.append(dialogueInput);
+    dialogueInput.__mmh3InsertApply = (value) => {
+      shot.dialogue = value;
+      persist();
+      updatePreview();
+    };
     const soundCol = el("div", "mmh3-sb-fcol");
     soundCol.append(el("label", "", "DIEGETIC SOUND"));
-    const shotSoundInput = document.createElement("input");
+    const shotSoundInput = document.createElement("textarea");
     shotSoundInput.placeholder = "e.g. rain, distant siren";
     shotSoundInput.value = shot.sound || "";
     soundCol.append(shotSoundInput);
+    shotSoundInput.__mmh3InsertApply = (value) => {
+      shot.sound = value;
+      persist();
+      updatePreview();
+    };
     fields.append(cameraCol, dialogueCol, soundCol);
 
     editor.append(head, chipbar, prompt, fields);
@@ -1335,19 +1376,19 @@ function setupStoryboard(node) {
     chips.forEach((chip) => {
       chip.onclick = () => {
         const label = chip.dataset.label;
-        const start = prompt.selectionStart ?? prompt.value.length;
-        const end = prompt.selectionEnd ?? start;
-        const before = prompt.value.slice(0, start);
-        const after = prompt.value.slice(end);
+        const target = insertTarget && root.contains(insertTarget.el)
+          ? insertTarget
+          : { el: prompt, apply: prompt.__mmh3InsertApply };
+        const start = target.el.selectionStart ?? target.el.value.length;
+        const end = target.el.selectionEnd ?? start;
+        const before = target.el.value.slice(0, start);
+        const after = target.el.value.slice(end);
         const insertion = before && !/\s$/.test(before) ? ` ${label}` : label;
-        prompt.value = `${before}${insertion}${after}`;
+        target.el.value = `${before}${insertion}${after}`;
         const caret = start + insertion.length;
-        prompt.focus();
-        prompt.setSelectionRange(caret, caret);
-        shot.prompt = prompt.value;
-        persist();
-        renderTrack();
-        updatePreview();
+        target.el.focus();
+        target.el.setSelectionRange(caret, caret);
+        target.apply(target.el.value);
       };
     });
 
@@ -1418,6 +1459,12 @@ function setupStoryboard(node) {
       const name = document.createElement("input");
       name.placeholder = "Name (e.g. Lena)";
       name.value = subject.name || "";
+      name.__mmh3InsertApply = (value) => {
+        subject.name = value.trim();
+        persist();
+        renderEditor();
+        updatePreview();
+      };
       const remove = el("button", "mmh3-sb-icon danger");
       remove.innerHTML = ICONS.close;
       remove.title = "Remove subject";
@@ -1425,6 +1472,12 @@ function setupStoryboard(node) {
       const definition = document.createElement("textarea");
       definition.placeholder = "Visual definition — appearance, clothing, reference tokens like <Picture 1>…";
       definition.value = subject.definition || "";
+      definition.__mmh3InsertApply = (value) => {
+        subject.definition = value.trim();
+        persist();
+        renderEditor();
+        updatePreview();
+      };
       card.append(top, definition);
 
       name.oninput = () => {
@@ -1495,17 +1548,31 @@ function setupStoryboard(node) {
       updatePreview();
     };
     negativeInput.value = data.negative_prompt;
+    negativeInput.__mmh3InsertApply = (value) => {
+      data.negative_prompt = value;
+      persist();
+    };
     negativeInput.oninput = () => {
       data.negative_prompt = negativeInput.value;
       persist();
     };
     soundInput.value = data.soundscape;
+    soundInput.__mmh3InsertApply = (value) => {
+      data.soundscape = value;
+      persist();
+      updatePreview();
+    };
     soundInput.oninput = () => {
       data.soundscape = soundInput.value;
       persist();
       updatePreview();
     };
     musicInput.value = data.music_style;
+    musicInput.__mmh3InsertApply = (value) => {
+      data.music_style = value;
+      persist();
+      updatePreview();
+    };
     musicInput.oninput = () => {
       data.music_style = musicInput.value;
       persist();
@@ -1575,6 +1642,7 @@ function setupStoryboard(node) {
     });
     if (!nodes.some((item) => String(item.id) === String(mediaSourceNodeId))) {
       mediaSourceNodeId = String(nodes[0].id);
+      node.properties.mmh3_media_source = mediaSourceNodeId;
     }
     mediaSourceSelect.value = mediaSourceNodeId;
     const source = nodes.find((item) => String(item.id) === String(mediaSourceNodeId));
@@ -1597,8 +1665,10 @@ function setupStoryboard(node) {
   };
   mediaSourceSelect.onchange = () => {
     mediaSourceNodeId = mediaSourceSelect.value;
+    node.properties.mmh3_media_source = mediaSourceNodeId;
     refreshMediaLabels();
   };
+  mediaRefreshBtn.onclick = () => refreshMediaLabels();
 
   /* ---------- render ---------- */
   const renderAll = () => {
@@ -1677,6 +1747,18 @@ function setupStoryboard(node) {
   api.addEventListener("minimax-h3/package-data-changed", refreshMediaLabels);
   render();
   refreshMediaLabels();
+  /* node configure order is not guaranteed on workflow load; retry until
+     the PackageData node's properties are available */
+  [500, 1500, 3000].forEach((delay) => {
+    setTimeout(() => {
+      const empty = !mediaLabels.images.length
+        && !mediaLabels.videos.length
+        && !mediaLabels.audios.length;
+      if (empty && getPackageNodes().length) {
+        refreshMediaLabels();
+      }
+    }, delay);
+  });
 }
 
 app.registerExtension({

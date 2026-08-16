@@ -18,7 +18,12 @@ import torch
 from h3rt.utils.config import MiniMaxH3DiTConfig
 from h3rt.models.model import MiniMaxH3Model
 from h3rt.utils.blockswap import BlockSwapManager, SwapBlock
-from h3rt.utils.types import SlotEntry
+from h3rt.utils.types import (
+    H3BlockSwap,
+    PoolPlan,
+    SlotEntry,
+    SwapAllocation,
+)
 
 torch.manual_seed(0)
 
@@ -86,9 +91,40 @@ for i in range(cfg.num_layers):
     blocks.append(SwapBlock(name=f"blocks.{i}", module=blk, keys=keys, names=names,
                             refs=refs, templates=templates))
 
-mgr = BlockSwapManager(blocks, reader, device, window_size=2, prefetch=True,
-                       prefetch_count=2, pin_memory=True, disk_workers=2,
-                       dtype=torch.bfloat16)
+block_mb = blocks[0].bytes_per_block() / 2 ** 20
+allocation = SwapAllocation(
+    config=H3BlockSwap(
+        enabled=True,
+        block_to_swap=cfg.num_layers - 2,
+        prefetch=True,
+        prefetch_count=2,
+        pin_memory=True,
+        disk_workers=2,
+        dtype="bfloat16",
+        offload_dit=True,
+    ),
+    pool=PoolPlan(
+        block_mb=block_mb,
+        free_mb=0.0,
+        effective_reserve_mb=0.0,
+        lora_per_slot_mb=0.0,
+        max_slots=4,
+        requested_slots=4,
+        window_size=2,
+        hot_blocks=0,
+        prefetch_count=2,
+        home_slots=2,
+        gpu_slots=4,
+    ),
+)
+mgr = BlockSwapManager(
+    blocks, reader, device,
+    prefetch=True,
+    pin_memory=True,
+    disk_workers=2,
+    allocation=allocation,
+    dtype=torch.bfloat16,
+)
 model._swap_mgr = mgr
 
 T, H, W, AT = 2, 16, 16, 8
@@ -106,6 +142,16 @@ assert tuple(v_a.shape) == (1, 8, 2, AT)
 
 v_v2, v_a2 = model.velocity(video, audio, 0.3, text, payload)
 print("2nd step hits/loads:", mgr.swap_hits, mgr.swap_loads)
+
+# VAE-phase offload: DIT leaves the GPU ring, then the first window reloads.
+mgr.offload_all()
+print("gpu ring after offload_all:", mgr._xfer._gpu_storage is None)
+assert mgr._xfer._gpu_storage is None
+mgr.restore_initial()
+v_v3, v_a3 = model.velocity(video, audio, 0.2, text, payload)
+print("post-restore velocity shapes:", tuple(v_v3.shape), tuple(v_a3.shape))
+assert tuple(v_v3.shape) == (1, 4, T, H, W)
+assert tuple(v_a3.shape) == (1, 8, 2, AT)
 
 # global registered home pool check
 registered = mgr._xfer._home_storage_tokens is not None

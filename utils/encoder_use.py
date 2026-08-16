@@ -148,6 +148,29 @@ class TextEncoderHandle:
         )
         return (states_pos, tags_pos), (states_neg, tags_neg)
 
+    @torch.inference_mode()
+    def encode_many(self, prompts: list[str], max_length: int = 4096):
+        """Encode multiple segment prompts while sharing streamed groups."""
+        enc = self._enc
+        if enc is None or getattr(enc, "_destroyed", False):
+            enc = self.load()
+        from ..models.text_encoder.types import TextEncoderInput
+        payloads = [
+            TextEncoderInput(text=str(p), max_length=max_length)
+            for p in prompts
+        ]
+        outs = enc.encode_many(payloads)
+        result = []
+        for out in outs:
+            states = out.last_hidden_state
+            tags = (
+                out.token_tags.to(states.device)
+                if out.token_tags is not None
+                else torch.ones(1, states.shape[1], dtype=torch.long)
+            )
+            result.append((states, tags))
+        return result
+
     def release_groups(self):
         enc = self._enc
         if enc is not None and not getattr(enc, "_destroyed", False):

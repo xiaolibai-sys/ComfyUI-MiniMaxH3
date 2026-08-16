@@ -3,7 +3,7 @@
 Builds both models with an identical tiny config and identical seeded random
 weights, runs one velocity step with the same latents/text/payload, and
 compares the video/audio outputs (the PR model returns the same flow-velocity
-tuple ``[-video_out, -slope_a * audio_out]``).
+tuple ``[-video_out, -audio_out]``).
 
 Run with the ComfyUI venv python (ComfyUI root auto-added for ``comfy.*``):
     python tests/test_pr_equivalence.py

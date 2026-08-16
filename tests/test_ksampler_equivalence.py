@@ -32,11 +32,16 @@ from h3rt.models.model import (
     MiniMaxH3Model,
     flow_sigmas,
     time_shift_sigma,
-    time_shift_slope,
 )
-from h3rt.utils.types import H3BlockSwap, H3TeaCache, H3Conditioning, AVLatent
+from h3rt.utils.types import (
+    H3BlockSwap,
+    H3TeaCache,
+    H3Conditioning,
+    AVLatent,
+    RuntimeOptions,
+    TextConditioning,
+)
 from h3rt.utils.lifecycle import load_model_handle
-from h3rt.utils.injection import InjectionContext
 
 torch.manual_seed(5)
 
@@ -72,7 +77,7 @@ SHIFT = 12.0
 SEED = 42
 swap = H3BlockSwap(enabled=True, block_to_swap=1, prefetch=True,
                    prefetch_count=2, pin_memory=True, disk_workers=2, dtype="float32")
-cond = H3Conditioning(text_states=text, text_token_tags=tags)
+cond = H3Conditioning(text=TextConditioning(states=text, tags=tags))
 latent = AVLatent(video=video, audio=audio)
 
 
@@ -95,17 +100,16 @@ for i in range(STEPS):
     v_v, v_a = m.velocity(x_v, x_a, s, text, cond.to_payload())
     dt = float(sigmas[i + 1]) - s
     x_v = x_v + dt * v_v
-    slope = time_shift_slope(max(s, 1e-6), 12.0, 3.0)
     dt_a = time_shift_sigma(float(sigmas[i + 1]), 12.0, 3.0) - \
         time_shift_sigma(s, 12.0, 3.0)
-    x_a = x_a + dt_a * (v_a / slope)
+    x_a = x_a + dt_a * v_a
 handle.unload()
 
 # ---- new path: official k-diffusion loop ----------------------------------
-from h3rt.nodes.h3_sampling import h3_sample
+from h3_test_utils import h3_sample
 
 result = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
-                   SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+                   SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
                    disable_pbar=True)
 rel_v = _rel(x_v, result.video)
 rel_a = _rel(x_a, result.audio)
@@ -113,7 +117,7 @@ print(f"euler packed-vs-manual rel_err: video={rel_v:.6f} audio={rel_a:.6f}")
 assert rel_v < 0.05 and rel_a < 0.5, "official AV-euler diverged from native dual-clock loop"
 
 res_cache = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
-                      SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+                      SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
                       disable_pbar=True, use_adaln_cache=True)
 rel_cache_v = _rel(res_cache.video, result.video)
 rel_cache_a = _rel(res_cache.audio, result.audio)
@@ -132,15 +136,14 @@ for i in range(STEPS):
                           shift_video=SHIFT, shift_audio=SA)
     dt = float(sigmas[i + 1]) - s
     x_v = x_v + dt * v_v
-    slope = time_shift_slope(max(s, 1e-6), SHIFT, SA)
     dt_a = time_shift_sigma(float(sigmas[i + 1]), SHIFT, SA) - \
         time_shift_sigma(s, SHIFT, SA)
-    x_a = x_a + dt_a * (v_a / slope)
+    x_a = x_a + dt_a * v_a
 handle.unload()
 
 res_sa = h3_sample(
     handle, cond, latent, None, STEPS, 1.0, "euler",
-    SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+    SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
     disable_pbar=True, shift_audio=SA)
 rel_sa_v = _rel(x_v, res_sa.video)
 rel_sa_a = _rel(x_a, res_sa.audio)
@@ -149,7 +152,7 @@ assert rel_sa_v < 0.05 and rel_sa_a < 0.5, "official AV shift_audio diverged fro
 
 res_sa_cache = h3_sample(
     handle, cond, latent, None, STEPS, 1.0, "euler",
-    SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+    SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
     disable_pbar=True, use_adaln_cache=True, shift_audio=SA)
 rel_sa_cache_v = _rel(res_sa_cache.video, res_sa.video)
 rel_sa_cache_a = _rel(res_sa_cache.audio, res_sa.audio)
@@ -159,7 +162,7 @@ assert rel_sa_cache_v < 1e-4 and rel_sa_cache_a < 1e-4, \
 
 # ---- ancestral sampler (CONST + model_patcher shim path) -------------------
 res_a = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler_ancestral",
-                  SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+                  SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
                   disable_pbar=True)
 assert torch.isfinite(res_a.video.float()).all() and torch.isfinite(res_a.audio.float()).all()
 print("euler_ancestral smoke OK (finite)")
@@ -168,7 +171,7 @@ print("euler_ancestral smoke OK (finite)")
 for sampler_name in ("heun", "dpmpp_2m"):
     res_s = h3_sample(
         handle, cond, latent, None, STEPS, 1.0, sampler_name,
-        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
         disable_pbar=True)
     print(sampler_name, "video finite",
           bool(torch.isfinite(res_s.video.float()).all()),
@@ -186,7 +189,7 @@ from h3rt.nodes.h3_sampling import H3_SCHEDULERS
 for scheduler_name in H3_SCHEDULERS:
     res_sched = h3_sample(
         handle, cond, latent, None, STEPS, 1.0, "euler",
-        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
         disable_pbar=True, scheduler_name=scheduler_name)
     assert torch.isfinite(res_sched.video.float()).all()
     assert torch.isfinite(res_sched.audio.float()).all()
@@ -197,7 +200,7 @@ from h3rt.nodes.h3_sampling import H3_SAMPLERS
 for sampler_name in H3_SAMPLERS:
     res_smp = h3_sample(
         handle, cond, latent, None, STEPS, 1.0, sampler_name,
-        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
         disable_pbar=True)
     assert torch.isfinite(res_smp.video.float()).all()
     assert torch.isfinite(res_smp.audio.float()).all()
@@ -207,7 +210,7 @@ for sampler_name in H3_SAMPLERS:
 for sampler_name in ("euler_ancestral", "dpmpp_2m", "ddim", "lcm", "dpm_fast"):
     res_smp_cache = h3_sample(
         handle, cond, latent, None, STEPS, 1.0, sampler_name,
-        SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+        SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
         disable_pbar=True, use_adaln_cache=True)
     assert torch.isfinite(res_smp_cache.video.float()).all()
     assert torch.isfinite(res_smp_cache.audio.float()).all()
@@ -227,7 +230,7 @@ try:
     for sampler_name in H3_SAMPLERS:
         res_no_fallback = h3_sample(
             handle, cond, latent, None, STEPS, 1.0, sampler_name,
-            SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+            SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
             disable_pbar=True, use_adaln_cache=True)
         assert torch.isfinite(res_no_fallback.video.float()).all()
         assert torch.isfinite(res_no_fallback.audio.float()).all()
@@ -235,7 +238,7 @@ try:
     for scheduler_name in H3_SCHEDULERS:
         res_no_fallback = h3_sample(
             handle, cond, latent, None, STEPS, 1.0, "euler",
-            SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+            SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
             disable_pbar=True, use_adaln_cache=True,
             scheduler_name=scheduler_name)
         assert torch.isfinite(res_no_fallback.video.float()).all()
@@ -247,15 +250,15 @@ finally:
 # ---- TeaCache attach/detach -------------------------------------------------
 res_tc = h3_sample(handle, cond, latent, None, STEPS, 1.0, "euler",
                    SHIFT, 1.0, SEED,
-                   InjectionContext.build(block_swap_args=swap,
-                                          teacache_args=H3TeaCache(start_block=0, max_skip_blocks=2)),
+                   RuntimeOptions(swap=swap,
+                                  teacache=H3TeaCache(start_block=0, max_skip_blocks=2)),
                    disable_pbar=True)
 assert torch.isfinite(res_tc.video.float()).all()
 print("teacache smoke OK (finite)")
 
 # ---- CFG cond+uncond ---------------------------------------------------------
 res_cfg = h3_sample(handle, cond, latent, cond, STEPS, 2.0, "euler",
-                    SHIFT, 1.0, SEED, InjectionContext.build(block_swap_args=swap),
+                    SHIFT, 1.0, SEED, RuntimeOptions(swap=swap),
                     disable_pbar=True)
 assert torch.isfinite(res_cfg.video.float()).all()
 print("cfg=2.0 smoke OK (finite)")

@@ -23,7 +23,12 @@ import zlib
 from h3rt.utils.config import MiniMaxH3DiTConfig
 from h3rt.models.model import MiniMaxH3Model
 from h3rt.utils.blockswap import BlockSwapManager, SwapBlock
-from h3rt.utils.types import SlotEntry
+from h3rt.utils.types import (
+    H3BlockSwap,
+    PoolPlan,
+    SlotEntry,
+    SwapAllocation,
+)
 from h3rt.models import quant
 
 torch.manual_seed(11)
@@ -128,9 +133,39 @@ def build_runner(quantize: bool, direct: bool = False):
                     g.data.copy_(qdata_map[key].to(g.data.device))
                 g.assign_to(mod, leaf)
         return model, None, qdata_map
-    mgr = BlockSwapManager(blocks, FakeReader(), device, window_size=2, prefetch=True,
-                           prefetch_count=2, pin_memory=True, disk_workers=2,
-                           dtype=torch.bfloat16)
+    block_mb = blocks[0].bytes_per_block() / 2 ** 20
+    allocation = SwapAllocation(
+        config=H3BlockSwap(
+            enabled=True,
+            block_to_swap=cfg.num_layers - 2,
+            prefetch=True,
+            prefetch_count=2,
+            pin_memory=True,
+            disk_workers=2,
+            dtype="bfloat16",
+        ),
+        pool=PoolPlan(
+            block_mb=block_mb,
+            free_mb=0.0,
+            effective_reserve_mb=0.0,
+            lora_per_slot_mb=0.0,
+            max_slots=4,
+            requested_slots=4,
+            window_size=2,
+            hot_blocks=0,
+            prefetch_count=2,
+            home_slots=cfg.num_layers - 2,
+            gpu_slots=4,
+        ),
+    )
+    mgr = BlockSwapManager(
+        blocks, FakeReader(), device,
+        prefetch=True,
+        pin_memory=True,
+        disk_workers=2,
+        allocation=allocation,
+        dtype=torch.bfloat16,
+    )
     model._swap_mgr = mgr
     return model, mgr, qdata_map
 

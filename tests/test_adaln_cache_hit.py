@@ -21,12 +21,18 @@ from h3rt.nodes.h3_sampling import (
     ADALN_PREBAKE_UNSUPPORTED,
     H3_SAMPLERS,
     H3_SCHEDULERS,
-    h3_sample,
 )
+from h3_test_utils import h3_sample
 from h3rt.utils.config import MiniMaxH3DiTConfig
-from h3rt.utils.injection import InjectionContext
+from h3rt.utils.types import RuntimeOptions
 from h3rt.utils.lifecycle import load_model_handle
-from h3rt.utils.types import AVLatent, H3BlockSwap, H3Conditioning
+from h3rt.utils.types import (
+    AVLatent,
+    H3BlockSwap,
+    H3Conditioning,
+    RuntimeOptions,
+    TextConditioning,
+)
 
 torch.manual_seed(23)
 
@@ -56,10 +62,10 @@ video = torch.randn(1, 4, 2, 16, 16, device=device, dtype=torch.float32)
 audio = torch.randn(1, 8, 2, 8, device=device, dtype=torch.float32)
 text = torch.randn(1, 8, 16, device=device, dtype=torch.float32)
 tags = torch.ones(1, 8, dtype=torch.long, device=device)
-cond = H3Conditioning(text_states=text, text_token_tags=tags)
+cond = H3Conditioning(text=TextConditioning(states=text, tags=tags))
 latent = AVLatent(video=video, audio=audio)
 handle = load_model_handle(ckpt_path)
-injection = InjectionContext.build(block_swap_args=H3BlockSwap(
+injection = RuntimeOptions(swap=H3BlockSwap(
     enabled=True, block_to_swap=1, prefetch=True, prefetch_count=2,
     pin_memory=True, disk_workers=2, dtype="float32"))
 

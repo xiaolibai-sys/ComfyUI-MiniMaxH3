@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import torch
-from .h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
+from .h3_sampling import H3_SAMPLERS, H3_SCHEDULERS, run_sampling
+from ..utils.types import (
+    FLConstraint,
+    RollingOutput,
+    RuntimeOptions,
+    SamplingAssets,
+    SamplingConfig,
+    SequenceSpec,
+)
 
 
 class MiniMaxH3KSampler:
@@ -54,13 +62,11 @@ class MiniMaxH3KSampler:
 
     def sample(self, model, positive, seed, steps, cfg,
                sampler_name, scheduler_name, shift_video, shift_audio,
-               denoise, use_adaln_cache, adaln_prebake_batch,
-               negative=None, latent=None,
-               teacache_args=None, block_swap_args=None):
+                denoise, use_adaln_cache, adaln_prebake_batch,
+                negative=None, latent=None,
+                teacache_args=None, block_swap_args=None):
         import comfy.utils
         import latent_preview
-        from ..utils.injection import InjectionContext
-        from .h3_sampling import h3_sample
 
         if latent is None:
             raise ValueError(
@@ -68,23 +74,63 @@ class MiniMaxH3KSampler:
                 "MiniMax H3 Conditioning.latent."
             )
 
-        injection = InjectionContext.build(block_swap_args=block_swap_args,
-                                           teacache_args=teacache_args)
         callback = latent_preview.prepare_callback(model, steps)
-
-        result = h3_sample(
-            model, positive, latent, negative, steps, cfg,
+        text_len = positive.text.states.shape[1]
+        latent_t, lat_h, lat_w = (
+            latent.video.shape[2],
+            latent.video.shape[3],
+            latent.video.shape[4],
+        )
+        audio_t = latent.audio.shape[-1]
+        vram_spec = SequenceSpec(
+            text_len=text_len,
+            latent_t=latent_t,
+            latent_h=lat_h,
+            latent_w=lat_w,
+            audio_t=audio_t,
+            media=positive.media,
+            cfg=cfg,
+        )
+        assets = SamplingAssets(
+            handle=model,
+            positive=positive,
+            negative=negative,
+            fl_constraint=(
+                getattr(positive, "fl_constraint", None)
+                or FLConstraint()
+            ),
+            av_encoder=getattr(positive, "av_encoder", None),
+            runtime=RuntimeOptions(
+                swap=block_swap_args,
+                teacache=teacache_args,
+            ),
+            vram_spec=vram_spec,
+            latent=latent,
+        )
+        config = SamplingConfig(
+            steps=steps,
+            cfg=cfg,
+            seed=seed,
             sampler_name=sampler_name,
             scheduler_name=scheduler_name,
             shift_video=shift_video,
             shift_audio=shift_audio,
+            use_adaln_cache=use_adaln_cache,
+            adaln_prebake_batch=adaln_prebake_batch,
+            width=latent.video.shape[4] * 16,
+            height=latent.video.shape[3] * 16,
             denoise=denoise,
-            seed=seed,
-            injection=injection,
+        )
+
+        result = run_sampling(
+            assets,
+            config,
             preview_callback=callback,
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-            use_adaln_cache=use_adaln_cache,
-            adaln_prebake_batch=adaln_prebake_batch)
+        )
+
+        if isinstance(result, RollingOutput):
+            return (result, result.stats)
 
         stats = (f"steps={result.steps} swap_hits={result.swap_hits} "
                  f"swap_loads={result.swap_loads} peak_vram={result.peak_vram_mb:.0f}MiB "
@@ -114,6 +160,17 @@ class MiniMaxH3Decode:
 
     def decode(self, latent, av_encoder):
         from ..models.vae import load_vae_pack
+        from ..utils.types import RollingOutput
+
+        if isinstance(latent, RollingOutput):
+            audio = latent.audio
+            if audio is None:
+                audio = torch.zeros(1, 2, 0)
+            return (latent.video, {
+                "waveform": audio,
+                "sample_rate": 32000,
+            })
+
         pack = load_vae_pack(av_encoder.video_path, av_encoder.audio_path)
         video = pack.decode_video(latent.video)
         # [B, 3, T, H, W] (-1..1) -> [T, H, W, 3] (0..1)

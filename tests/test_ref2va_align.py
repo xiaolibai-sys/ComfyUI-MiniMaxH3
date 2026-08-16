@@ -343,7 +343,7 @@ def our_ref_blocks(ref_images, ref_videos, ref_video_audios, ref_audios,
                        for i in range(1, 4)})
         cond, latent = node.make(FakeEncoder(), FakeVae(), prompt,
                                  width, height, length, "match", **kwargs)
-        return cond.refs, latent
+        return [ref.to_payload() for ref in cond.media.refs], latent
     finally:
         V.load_vae_pack = orig_load
 
@@ -427,8 +427,8 @@ def check_i2v_conditioning():
         )[0]
         assert captured["prompt"] == "a cat"
         assert [i["type"] for i in captured["items"]] == ["image", "image"]
-        assert [k["resolved_frame_index"] for k in cond.keyframes] == [0, 4]
-        assert len(cond.keyframes) == 2
+        assert [k.resolved_frame_index for k in cond.media.keyframes] == [0, 4]
+        assert len(cond.media.keyframes) == 2
         try:
             MiniMaxH3Conditioning().make(
                 FakeEncoder(),

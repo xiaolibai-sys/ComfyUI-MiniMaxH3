@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
+import folder_paths
+
+
 def _has_reference_media(package) -> bool:
     if not package:
         return False
@@ -10,6 +15,109 @@ def _has_reference_media(package) -> bool:
         or package.get("videos")
         or package.get("audios")
     )
+
+
+def _load_fl_image_tensor(info):
+    if info is None:
+        return None
+    try:
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        path = folder_paths.get_annotated_filepath(info.get("name"))
+        with Image.open(path) as image:
+            array = np.array(image.convert("RGB"), dtype=np.float32) / 255.0
+        return torch.from_numpy(array).unsqueeze(0)
+    except Exception:
+        return None
+
+
+def _fl_data(fl_constraint) -> dict:
+    if not isinstance(fl_constraint, dict):
+        return {}
+    raw = fl_constraint.get("fl_data")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _frame_number_at(time: float, fps: int) -> int:
+    from .conditioning import align_frame_count
+
+    raw = round(float(time) * int(fps or 24))
+    if raw <= 0:
+        return 0
+    return align_frame_count(raw)
+
+
+def _build_rolling_segments(fl_constraint, base_prompt: str, fps: int = 24):
+    """Return LLM-ready rolling segment descriptors and the global negative prompt."""
+    data = _fl_data(fl_constraint)
+    keyframes = data.get("keyframes") or []
+    if len(keyframes) < 2:
+        return [], str(data.get("global_negative_prompt") or "")
+    fps = int(data.get("fps") or fps or 24)
+
+    first_frame = fl_constraint.get("first_frame") if isinstance(fl_constraint, dict) else None
+    last_frame = fl_constraint.get("last_frame") if isinstance(fl_constraint, dict) else None
+    total_duration = float(keyframes[-1].get("time") or 0.0)
+    base_prompt = str(base_prompt or "").strip()
+    segments = []
+
+    for index in range(len(keyframes) - 1):
+        start = keyframes[index]
+        end = keyframes[index + 1]
+        start_time = float(start.get("time") or 0.0)
+        end_time = float(end.get("time") or start_time + 1.0)
+
+        start_image = _load_fl_image_tensor(start.get("image"))
+        if start_image is None and abs(start_time) < 1e-6:
+            start_image = first_frame
+        end_image = _load_fl_image_tensor(end.get("image"))
+        if end_image is None and abs(end_time - total_duration) < 1e-6:
+            end_image = last_frame
+
+        segment_prompt = " ".join(
+            part for part in (base_prompt, str(start.get("prompt") or ""))
+            if part.strip()
+        )
+        segments.append({
+            "index": index + 1,
+            "start_keyframe_index": index + 1,
+            "end_keyframe_index": index + 2,
+            "start_time": start_time,
+            "end_time": end_time,
+            "start_frame": _frame_number_at(start_time, fps),
+            "end_frame": _frame_number_at(end_time, fps),
+            "start_image": start_image,
+            "end_image": end_image,
+            "start_image_exists": start_image is not None,
+            "end_image_exists": end_image is not None,
+            "start_image_note": str(start.get("note") or ""),
+            "end_image_note": str(end.get("note") or ""),
+            "prompt": segment_prompt,
+            "negative_prompt": str(start.get("negative_prompt") or ""),
+        })
+
+    return segments, str(data.get("global_negative_prompt") or "")
+
+
+def _fl_timeline_metadata(fl_constraint):
+    """Return (frame_count, total_duration) derived from FL keyframes."""
+    data = _fl_data(fl_constraint)
+    keyframes = data.get("keyframes") or []
+    if len(keyframes) < 2:
+        return None, None
+    fps = int(data.get("fps") or 24)
+    duration = float(keyframes[-1].get("time") or 0.0)
+    if duration <= 0:
+        return None, None
+    return _frame_number_at(duration, fps), duration
 
 
 def _refiner_preview(prompt_ref, text) -> str:
@@ -45,7 +153,7 @@ def _mode_from_fl_constraint(fl_constraint) -> str | None:
 def _prepare_refiner_input(
     prompt,
     package,
-    fl_constraint,
+    fl_constraint=None,
 ):
     if prompt is not None:
         prompt_ref = prompt if isinstance(prompt, dict) else {}
@@ -147,7 +255,6 @@ class MiniMaxH3ContextIRRefiner:
             "optional": {
                 "prompt": ("MINIMAX_H3_PROMPT",),
                 "package": ("PACKAGE_DATA",),
-                "fl_constraint": ("MINIMAX_H3_FL_CONSTRAINT",),
                 "timeout": ("INT", {"default": 300, "min": 10, "max": 3600}),
             },
         }
@@ -159,14 +266,20 @@ class MiniMaxH3ContextIRRefiner:
     OUTPUT_NODE = True
 
     def polish(self, instruction="", music_style="", prompt=None,
-               package=None, fl_constraint=None, timeout=300):
+               package=None, timeout=300):
+        prompt_obj = prompt
+        source_negative = (
+            prompt_obj.get("negative_prompt")
+            if isinstance(prompt_obj, dict)
+            else ""
+        )
         prompt, output_mode, frame_count, duration, ratio = _prepare_refiner_input(
-            prompt, package, fl_constraint)
+            prompt, package)
         if not prompt.strip():
             return _refiner_result({
                 "text": prompt, "mode": output_mode,
                 "frame_count": frame_count, "total_duration": duration,
-                "ratio": ratio}, prompt)
+                "ratio": ratio, "negative_prompt": source_negative}, prompt)
 
         from ..utils.refiners import polish_with_context_ir
 
@@ -175,7 +288,6 @@ class MiniMaxH3ContextIRRefiner:
             instruction=instruction,
             music_style=music_style,
             package=package,
-            fl_constraint=fl_constraint,
             duration=duration or 5,
             ratio=ratio,
             timeout=timeout,
@@ -183,7 +295,7 @@ class MiniMaxH3ContextIRRefiner:
         return _refiner_result({
             "text": text, "mode": output_mode,
             "frame_count": frame_count, "total_duration": duration,
-            "ratio": ratio}, text)
+            "ratio": ratio, "negative_prompt": source_negative}, text)
 
 
 class MiniMaxH3OpenAICompatibleRefiner:
@@ -251,20 +363,101 @@ class MiniMaxH3OpenAICompatibleRefiner:
                reasoning="auto", reasoning_effort="auto", temperature=1.0,
                top_p=0.95, max_tokens=0, timeout=120, extra_body_json=""):
         prompt_obj = prompt
+        source_negative = (
+            prompt_obj.get("negative_prompt")
+            if isinstance(prompt_obj, dict)
+            else ""
+        )
         prompt, output_mode, frame_count, duration, ratio = _prepare_refiner_input(
             prompt, package, fl_constraint)
-        if not prompt.strip():
+
+        rolling_segments, global_negative = _build_rolling_segments(
+            fl_constraint, prompt)
+        has_rolling_segments = bool(
+            rolling_segments
+            and any(
+                str(segment.get("prompt") or "").strip()
+                or segment.get("start_image") is not None
+                or segment.get("end_image") is not None
+                for segment in rolling_segments
+            )
+        )
+        if has_rolling_segments:
+            rolling_frame_count, rolling_duration = _fl_timeline_metadata(
+                fl_constraint)
+            if rolling_frame_count is not None:
+                frame_count = rolling_frame_count
+            if rolling_duration is not None:
+                duration = rolling_duration
+            output_mode = "FL2VA"
+            ratio = "adaptive"
+        if not prompt.strip() and not has_rolling_segments:
             return _refiner_result({
                 "text": prompt, "mode": output_mode,
                 "frame_count": frame_count, "total_duration": duration,
-                "ratio": ratio}, prompt)
+                "ratio": ratio, "negative_prompt": source_negative}, prompt)
 
-        from ..utils.refiners import polish_with_openai_compatible
+        from ..utils.refiners import (
+            polish_with_openai_compatible,
+            polish_with_openai_compatible_rolling,
+        )
 
         subjects = (
             prompt_obj.get("subjects")
             if isinstance(prompt_obj, dict) else None
         )
+        if has_rolling_segments:
+            refined_prompts, refined_negatives = (
+                polish_with_openai_compatible_rolling(
+                    prompt=prompt,
+                    base_url=base_url,
+                    model=model,
+                    instruction=instruction,
+                    music_style=music_style,
+                    rolling_segments=rolling_segments,
+                    global_negative_prompt=global_negative,
+                    base_negative_prompt=(
+                        prompt_obj.get("negative_prompt")
+                        if isinstance(prompt_obj, dict)
+                        else ""
+                    ),
+                    output_mode=output_mode,
+                    ratio=ratio,
+                    supports_image=supports_image,
+                    supports_video=supports_video,
+                    supports_audio=supports_audio,
+                    api_key_env=api_key_env,
+                    reasoning=reasoning,
+                    reasoning_effort=reasoning_effort,
+                    extra_body_json=extra_body_json,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+            )
+            joined = "\n\n".join(refined_prompts)
+            return _refiner_result({
+                "text": joined,
+                "mode": output_mode,
+                "frame_count": frame_count,
+                "total_duration": duration,
+                "ratio": ratio,
+                "negative_prompt": source_negative,
+                "segment_prompts": refined_prompts,
+                "segment_negative_prompts": refined_negatives,
+                "fl_data": (
+                    fl_constraint.get("fl_data")
+                    if isinstance(fl_constraint, dict)
+                    else None
+                ),
+                "offload_dit": bool(
+                    fl_constraint.get("offload_dit")
+                    if isinstance(fl_constraint, dict)
+                    else False
+                ),
+            }, joined)
+
         text = polish_with_openai_compatible(
             prompt=prompt,
             base_url=base_url,
@@ -272,7 +465,6 @@ class MiniMaxH3OpenAICompatibleRefiner:
             instruction=instruction,
             music_style=music_style,
             package=package,
-            fl_constraint=fl_constraint,
             output_mode=output_mode,
             frame_count=frame_count,
             total_duration=duration,
@@ -293,4 +485,4 @@ class MiniMaxH3OpenAICompatibleRefiner:
         return _refiner_result({
             "text": text, "mode": output_mode,
             "frame_count": frame_count, "total_duration": duration,
-            "ratio": ratio}, text)
+            "ratio": ratio, "negative_prompt": source_negative}, text)

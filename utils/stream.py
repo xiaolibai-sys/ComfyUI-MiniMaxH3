@@ -15,6 +15,7 @@ import json
 import os
 import struct
 import threading
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -59,29 +60,22 @@ def _pread(fd: int, n: int, offset: int) -> bytes:
 
 
 def _pread_path(path: str, n: int, offset: int):
-    """Read ``n`` bytes at ``offset`` using a private file handle.
-
-    ``win32file.ReadFile`` returns a memoryview over a bytearray that is not
-    safe to keep while another thread performs a read on the same handle.
-    Opening a fresh handle per positioned read lets BlockSwap disk workers
-    read different blocks concurrently without a global file lock.
-    """
+    """Read exactly ``n`` bytes at ``offset`` using a private file handle."""
     fd = os.open(path, os.O_RDONLY | os.O_BINARY)
     try:
-        import msvcrt
-        import pywintypes  # type: ignore
-        import win32file  # type: ignore
-        h = msvcrt.get_osfhandle(fd)
-        ov = pywintypes.OVERLAPPED()
-        ov.Offset = offset & 0xFFFFFFFF
-        ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
-        try:
-            _, data = win32file.ReadFile(h, n, ov)
-        except pywintypes.error as e:
-            if e.winerror != win32file.ERROR_IO_PENDING:
-                raise
-            _, data = win32file.GetOverlappedResult(h, ov, True)
-        return data
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks = []
+        remaining = n
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                raise OSError(
+                    f"short read from {path}: expected {n} bytes, "
+                    f"got {n - remaining}"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     finally:
         os.close(fd)
 
@@ -101,6 +95,31 @@ def _tensor_from_buffer(raw, shape, dtype: torch.dtype) -> torch.Tensor:
     import numpy as np
     buf = np.frombuffer(raw, dtype=np.uint8).copy()
     return torch.from_numpy(buf).view(dtype).reshape(tuple(shape))
+
+
+def _tensor_from_file(path: str, nbytes: int, offset: int,
+                      shape: list, dtype: torch.dtype) -> torch.Tensor:
+    """Read a safetensors tensor through a short-lived numpy memmap.
+
+    ``os.read`` allocates a Python bytes object for every tensor and can raise
+    ``MemoryError`` under BlockSwap/VAE memory pressure. A read-only memmap
+    avoids that transient bytes allocation; ``clone()`` detaches the returned
+    tensor before the mapping is closed.
+    """
+    import numpy as np
+
+    mm = np.memmap(path, dtype=np.uint8, mode="r", offset=offset, shape=(nbytes,))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return (
+                torch.from_numpy(mm)
+                .clone()
+                .view(dtype)
+                .reshape(tuple(shape))
+            )
+    finally:
+        mm._mmap.close()
 
 
 class _SingleFileReader:
@@ -131,8 +150,13 @@ class _SingleFileReader:
         info = self._header[name]
         begin, end = info["data_offsets"]
         nbytes = end - begin
-        raw = _pread_path(self._path, nbytes, self._data_offset + begin)
-        return _tensor_from_buffer(raw, shape, dt)
+        return _tensor_from_file(
+            self._path,
+            nbytes,
+            self._data_offset + begin,
+            shape,
+            dt,
+        )
 
     def get_tensor_info(self, name: str) -> tuple[list, torch.dtype]:
         """Return (shape, dtype) from the header without reading data."""
@@ -140,6 +164,14 @@ class _SingleFileReader:
         if info is None or not isinstance(info, dict):
             raise KeyError(f"{name} not in {self._path}")
         return list(info["shape"]), self._torch_dtype(info["dtype"])
+
+    def get_tensor_offsets(self, name: str) -> tuple[int, int]:
+        """Return (file_offset, nbytes) without reading tensor data."""
+        info = self._header.get(name)
+        if info is None or not isinstance(info, dict):
+            raise KeyError(f"{name} not in {self._path}")
+        begin, end = info["data_offsets"]
+        return self._data_offset + begin, end - begin
 
     def _torch_dtype(self, dt: str) -> torch.dtype:
         return self._dtype_map[dt]
@@ -223,6 +255,14 @@ class BlockReader:
             return self._single.get_tensor_info(name)
         shard = self._weight_map[name]
         return self._shards.get_tensor_info(shard, name)  # type: ignore[union-attr]
+
+    def get_tensor_offsets(self, name: str) -> tuple[int, int]:
+        """Header-only (file_offset, nbytes); single-file mmap support."""
+        if self._single is not None:
+            return self._single.get_tensor_offsets(name)
+        raise NotImplementedError(
+            "mmap tensor offsets are not implemented for sharded checkpoints"
+        )
 
     def get_tensors(self, names: list[str]) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {}

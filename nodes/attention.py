@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..attention.backends import BACKEND_NAMES, available_backends, best_available
+from ..attention.backends import BACKEND_NAMES
 from ..utils.types import AttentionConfig
 
 _DEFAULT_BACKEND = "sageattn2" if "sageattn2" in BACKEND_NAMES else "auto"
@@ -35,10 +35,7 @@ class MiniMaxH3AttentionConfig:
     CATEGORY = "MiniMax-H3/loaders"
 
     def configure(self, backend=_DEFAULT_BACKEND, force_backend=False):
-        cfg = AttentionConfig(
+        return (AttentionConfig(
             backend=backend,
             force_backend=force_backend,
-            available=tuple(available_backends()),
-            best=best_available(),
-        )
-        return (cfg,)
+        ),)

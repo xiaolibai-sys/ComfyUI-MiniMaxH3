@@ -7,7 +7,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from ..models import quant
 from .stream import BlockReader
-from .swap_types import SwapBlock, _entry_of, free_module_storage
+from .types import SwapBlock
+from .swap_types import _entry_of, free_module_storage
 from .types import SlotEntry
 
 

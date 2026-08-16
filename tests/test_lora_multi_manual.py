@@ -23,9 +23,9 @@ from safetensors.torch import save_file
 
 from h3rt.models.lora import fold_lora_into_module, parse_lora_h3
 from h3rt.models.model import MiniMaxH3Model
-from h3rt.nodes.h3_sampling import h3_sample
+from h3_test_utils import h3_sample
 from h3rt.utils.config import MiniMaxH3DiTConfig
-from h3rt.utils.injection import InjectionContext
+from h3rt.utils.types import RuntimeOptions
 from h3rt.utils.lifecycle import load_model_handle
 from h3rt.utils.types import (
     AVLatent,
@@ -33,6 +33,7 @@ from h3rt.utils.types import (
     H3Conditioning,
     H3Lora,
     H3LoraSet,
+    TextConditioning,
 )
 
 torch.manual_seed(23)
@@ -167,13 +168,13 @@ audio = torch.randn(1, 8, 2, 8, device=device, dtype=torch.float32)
 text = torch.randn(1, 8, 64, device=device, dtype=torch.float32)
 tags = torch.ones(1, 8, dtype=torch.long, device=device)
 latent = AVLatent(video=video, audio=audio)
-cond = H3Conditioning(text_states=text, text_token_tags=tags)
+cond = H3Conditioning(text=TextConditioning(states=text, tags=tags))
 
 
 def run(handle):
     return h3_sample(
         handle, cond, latent, None, 5, 1.0, "euler",
-        12.0, 1.0, 123, InjectionContext.build(block_swap_args=swap),
+        12.0, 1.0, 123, RuntimeOptions(swap=swap),
         disable_pbar=True, use_adaln_cache=True)
 
 

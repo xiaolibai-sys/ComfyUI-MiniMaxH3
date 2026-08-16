@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 
 import folder_paths
 
-from ..utils.types import EncoderStreamConfig
+from ..utils.types import EncoderStreamConfig, VAERef
 from ..utils.lifecycle import load_model_handle
 from ..utils.encoder_use import TextEncoderHandle
 
@@ -15,13 +14,6 @@ from ..utils.encoder_use import TextEncoderHandle
 TEXT_ENCODER_MODEL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "models", "text_encoder", "ModelsData", "Minimax EncModel")
-
-
-@dataclass
-class VAERef:
-    """Paths only; the pack is loaded lazily (and cached) by decode/sample nodes."""
-    video_path: str
-    audio_path: str = ""
 
 
 class MiniMaxH3Loader:

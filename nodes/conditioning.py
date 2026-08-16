@@ -8,29 +8,21 @@ import torch
 
 import comfy.utils
 
-from ..utils.types import AVLatent, H3Conditioning
+from ..utils.types import (
+    AVLatent,
+    H3Conditioning,
+    KeyframeCondition,
+    MediaConditioning,
+    ReferenceCondition,
+    TextConditioning,
+)
+from ..utils.temporal import align_frame_count, temporal_shape
 
 FPS = 24
 AUDIO_LATENT_FPS = 40
 MAX_RESOLUTION = 8192
 CANVAS_MULTIPLE = 32
 REF_IMAGE_SHORT_EDGE = 2048
-
-
-def align_frame_count(n: int) -> int:
-    while n % 17 != 5:
-        n += 1
-    return n
-
-
-def video_latent_t(frame_count: int) -> int:
-    return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
-
-
-def temporal_shape(length: int):
-    frame_count = align_frame_count(max(5, length))
-    duration = frame_count / FPS
-    return frame_count, video_latent_t(frame_count), round(duration * AUDIO_LATENT_FPS)
 
 
 def _resize(image: torch.Tensor, width: int, height: int, crop: str) -> torch.Tensor:
@@ -122,10 +114,72 @@ class MiniMaxH3Conditioning:
         else:
             frame_count, total_duration, _, _ = _resolve_duration(
                 prompt_ref, package)
+
+        if (
+            fl_constraint is None
+            and isinstance(prompt_ref, dict)
+            and prompt_ref.get("fl_data")
+        ):
+            fl_constraint = {
+                "first_frame": None,
+                "last_frame": None,
+                "fl_data": prompt_ref["fl_data"],
+                "offload_dit": bool(prompt_ref.get("offload_dit") or False),
+            }
+
+        fl_prompts = []
+        fl_negative_prompts = []
+        provided_segment_prompts = None
+        provided_segment_negatives = None
+        if isinstance(prompt_ref, dict):
+            if isinstance(prompt_ref.get("segment_prompts"), (list, tuple)):
+                provided_segment_prompts = [
+                    str(value).strip()
+                    for value in prompt_ref["segment_prompts"]
+                ]
+            if isinstance(prompt_ref.get("segment_negative_prompts"), (list, tuple)):
+                provided_segment_negatives = [
+                    str(value).strip()
+                    for value in prompt_ref["segment_negative_prompts"]
+                ]
+        if isinstance(fl_constraint, dict):
+            fl_data = fl_constraint.get("fl_data")
+            if fl_data:
+                import json
+                try:
+                    data = json.loads(fl_data)
+                except Exception:
+                    data = {}
+                if provided_segment_prompts is None:
+                    fl_prompts = [
+                        str(kf.get("prompt") or "").strip()
+                        for kf in data.get("keyframes") or []
+                    ]
+                else:
+                    fl_prompts = provided_segment_prompts
+                if provided_segment_negatives is None:
+                    fl_negative_prompts = [
+                        str(kf.get("negative_prompt") or "").strip()
+                        for kf in data.get("keyframes") or []
+                    ]
+                    global_negative = str(
+                        data.get("global_negative_prompt") or ""
+                    ).strip()
+                    if global_negative:
+                        fl_negative_prompts = [
+                            (f"{seg}\n{global_negative}".strip()
+                             if seg else global_negative)
+                            for seg in fl_negative_prompts
+                        ]
+                else:
+                    fl_negative_prompts = provided_segment_negatives
+
         if not prompt.strip():
-            raise ValueError(
-                "MiniMax H3 Conditioning: prompt did not provide a prompt."
-            )
+            if not fl_prompts:
+                raise ValueError(
+                    "MiniMax H3 Conditioning: prompt did not provide a prompt."
+                )
+            prompt = fl_prompts[0]
         length = frame_count
         if package is not None and fl_constraint is not None:
             raise ValueError(
@@ -171,20 +225,65 @@ class MiniMaxH3Conditioning:
                     prompt, negative_prompt,
                     minimax_ref_items=ref_items))
             neg_cond = H3Conditioning(
-                text_states=neg_states,
-                text_token_tags=neg_tags,
-                frame_count=frame_count,
+                text=TextConditioning(
+                    states=neg_states,
+                    tags=neg_tags,
+                ),
             )
         else:
             text_states, tags = text_encoder.encode(
                 prompt, minimax_ref_items=ref_items)
             neg_cond = None
 
+        segment_texts = ()
+        segment_negative_texts = ()
+        if isinstance(fl_constraint, dict):
+            if fl_prompts:
+                prompts = list(fl_prompts)
+                if provided_segment_prompts is None and len(prompts) > 1:
+                    prompts = prompts[:-1]
+                prompts = [p for p in prompts if p]
+                if prompts:
+                    encoded = text_encoder.encode_many(prompts)
+                    segment_texts = tuple(
+                        TextConditioning(states=states, tags=tags)
+                        for states, tags in encoded
+                    )
+            if fl_negative_prompts:
+                prompts = list(fl_negative_prompts)
+                if provided_segment_negatives is None and len(prompts) > 1:
+                    prompts = prompts[:-1]
+                prompts = [p for p in prompts if p]
+                if prompts:
+                    encoded = text_encoder.encode_many(prompts)
+                    segment_negative_texts = tuple(
+                        TextConditioning(states=states, tags=tags)
+                        for states, tags in encoded
+                    )
+
         cond = H3Conditioning(
-            text_states=text_states,
-            text_token_tags=tags,
-            keyframes=keyframes,
-            frame_count=frame_count,
+            text=TextConditioning(
+                states=text_states,
+                tags=tags,
+            ),
+            segment_texts=segment_texts,
+            segment_negative_texts=segment_negative_texts,
+            media=MediaConditioning(
+                keyframes=tuple(
+                    KeyframeCondition(
+                        resolved_frame_index=kf["resolved_frame_index"],
+                        latent=kf["latent"],
+                    )
+                    for kf in keyframes
+                ),
+                frame_count=frame_count,
+            ),
+            fl_constraint=(
+                fl_constraint
+                if isinstance(fl_constraint, dict)
+                else None
+            ),
+            av_encoder=av_encoder,
         )
         latent = _make_av_latent(width, height, length)
         return (cond, neg_cond, latent)
@@ -375,9 +474,24 @@ class MiniMaxH3ReferenceToVideo:
 
         text_states, tags = text_encoder.encode(prompt, minimax_ref_items=ref_items)
         cond = H3Conditioning(
-            text_states=text_states,
-            text_token_tags=tags,
-            refs=ref_blocks,
-            frame_count=frame_count,
+            text=TextConditioning(
+                states=text_states,
+                tags=tags,
+            ),
+            media=MediaConditioning(
+                refs=tuple(
+                    ReferenceCondition(
+                        kind=ref["kind"],
+                        latent=ref.get("latent"),
+                        latent_t=ref.get("latent_t", 0),
+                        latent_h=ref.get("latent_h", 0),
+                        latent_w=ref.get("latent_w", 0),
+                        ref_audio_t=ref.get("ref_audio_t", 0),
+                        audio_latent=ref.get("audio_latent"),
+                    )
+                    for ref in ref_blocks
+                ),
+                frame_count=frame_count,
+            ),
         )
         return (cond, latent)

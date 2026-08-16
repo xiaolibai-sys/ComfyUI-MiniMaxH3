@@ -3,179 +3,348 @@ import { api } from "../../../scripts/api.js";
 
 const style = document.createElement("style");
 style.textContent = `
-.mmh3-package-root {
-  display: grid;
-  grid-template-rows: repeat(3, minmax(0, 1fr));
+.mmh3-pkg-root {
+  --pkg-text: var(--input-text, #d8dbe2);
+  --pkg-dim: var(--descrip-text, #8b91a0);
+  --pkg-border: var(--border-color, #3a3f4b);
+  --pkg-border-strong: #4a5163;
+  --pkg-surface: var(--comfy-input-bg, #22262f);
+  --pkg-raised: rgba(255, 255, 255, 0.035);
+  --pkg-accent: #4cc2a8;
+  --pkg-c-images: #38bdf8;
+  --pkg-c-videos: #f5b04c;
+  --pkg-c-audios: #b78cf0;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  height: 600px;
+  height: 480px;
   box-sizing: border-box;
   padding: 8px;
   overflow: hidden;
   font-size: 12px;
-  color: var(--input-text, #d5d8de);
+  color: var(--pkg-text);
 }
-.mmh3-package-section {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-  border: 1px solid var(--border-color, #3a3f4b);
-  border-radius: 10px;
-  background: var(--comfy-input-bg, #1e2127);
-  padding: 8px;
+.mmh3-pkg-root *,
+.mmh3-pkg-root *::before,
+.mmh3-pkg-root *::after {
+  box-sizing: border-box;
 }
-.mmh3-package-section-header {
+.mmh3-pkg-root button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.mmh3-pkg-root input,
+.mmh3-pkg-root select {
+  font: inherit;
+  font-size: 11px;
+  color: var(--pkg-text);
+  background: var(--pkg-surface);
+  border: 1px solid var(--pkg-border);
+  border-radius: 6px;
+  padding: 4px 7px;
+  outline: none;
+  width: 100%;
+}
+.mmh3-pkg-root input:focus,
+.mmh3-pkg-root select:focus {
+  border-color: var(--pkg-accent);
+}
+.mmh3-pkg-root ::-webkit-scrollbar {
+  width: 8px;
+}
+.mmh3-pkg-root ::-webkit-scrollbar-thumb {
+  background: var(--pkg-border-strong);
+  border-radius: 4px;
+}
+.mmh3-pkg-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* tab bar */
+.mmh3-pkg-tabs {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 6px;
 }
-.mmh3-package-section-title {
+.mmh3-pkg-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--pkg-border);
+  background: var(--pkg-raised);
+  color: var(--pkg-dim);
+  font-size: 11px;
   font-weight: 600;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
 }
-.mmh3-package-section-count {
-  opacity: 0.72;
+.mmh3-pkg-tab:hover {
+  border-color: currentColor;
 }
-.mmh3-package-section-button {
-  margin-left: auto;
-  min-height: 26px;
-  border: 1px solid var(--border-color, #525a68);
-  border-radius: 8px;
-  background: var(--comfy-input-bg, #262a32);
-  color: var(--input-text, #d5d8de);
-  cursor: pointer;
-  padding: 0 10px;
+.mmh3-pkg-tab .mmh3-pkg-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
 }
-.mmh3-package-section-button:disabled {
-  opacity: 0.45;
+.mmh3-pkg-tab .mmh3-pkg-tab-count {
+  font-weight: 400;
+  opacity: 0.75;
+}
+.mmh3-pkg-tab.k-images { color: var(--pkg-c-images); }
+.mmh3-pkg-tab.k-videos { color: var(--pkg-c-videos); }
+.mmh3-pkg-tab.k-audios { color: var(--pkg-c-audios); }
+.mmh3-pkg-tab span.tt { color: var(--pkg-text); }
+.mmh3-pkg-tab.on {
+  border-color: currentColor;
+  background: var(--pkg-surface);
+}
+.mmh3-pkg-spacer {
+  flex: 1;
+}
+.mmh3-pkg-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  border-radius: 7px;
+  border: 1px dashed var(--pkg-border-strong);
+  color: var(--pkg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.mmh3-pkg-add:hover:not(:disabled) {
+  color: var(--pkg-accent);
+  border-color: var(--pkg-accent);
+  background: rgba(76, 194, 168, 0.08);
+}
+.mmh3-pkg-add:disabled {
+  opacity: 0.4;
   cursor: default;
 }
-.mmh3-package-list {
+
+/* content */
+.mmh3-pkg-content {
   flex: 1;
   min-height: 0;
-  max-height: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
   overflow-y: auto;
   scrollbar-width: thin;
-  padding: 2px;
+  border: 1px solid var(--pkg-border);
+  border-radius: 8px;
+  background: var(--pkg-raised);
+  padding: 10px;
 }
-.mmh3-package-item {
-  width: 100%;
-  min-width: 0;
+.mmh3-pkg-empty {
+  height: 100%;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 10px;
-  box-sizing: border-box;
-  border: 1px solid var(--border-color, #3a3f4b);
-  border-radius: 10px;
-  background: var(--comfy-input-bg, #171a20);
-  padding: 8px;
+  justify-content: center;
+  gap: 8px;
+  color: var(--pkg-dim);
+  font-size: 12px;
+  border: 1px dashed var(--pkg-border);
+  border-radius: 8px;
 }
-.mmh3-package-thumb {
+.mmh3-pkg-empty .icon {
+  opacity: 0.5;
+}
+.mmh3-pkg-empty .hint {
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+/* image grid */
+.mmh3-pkg-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.mmh3-pkg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--pkg-border);
+  border-radius: 8px;
+  background: var(--pkg-surface);
+  padding: 7px;
+  min-width: 0;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.mmh3-pkg-card:hover {
+  border-color: var(--pkg-border-strong);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+.mmh3-pkg-thumbwrap {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #000;
+}
+.mmh3-pkg-thumbwrap img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.mmh3-pkg-thumbname {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 7px 5px;
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.92);
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.mmh3-pkg-chip {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(2px);
+}
+.mmh3-pkg-chip.k-images { color: var(--pkg-c-images); }
+.mmh3-pkg-chip.k-videos { color: var(--pkg-c-videos); }
+.mmh3-pkg-chip.k-audios { color: var(--pkg-c-audios); }
+.mmh3-pkg-x {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.mmh3-pkg-thumbwrap:hover .mmh3-pkg-x,
+.mmh3-pkg-row:hover .mmh3-pkg-x {
+  display: inline-flex;
+}
+.mmh3-pkg-x:hover {
+  background: var(--error-text, #f26d6d);
+}
+.mmh3-pkg-name {
+  font-size: 10px;
+  color: var(--pkg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* video / audio rows */
+.mmh3-pkg-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mmh3-pkg-row {
+  position: relative;
+  display: flex;
+  gap: 12px;
+  border: 1px solid var(--pkg-border);
+  border-radius: 8px;
+  background: var(--pkg-surface);
+  padding: 10px;
+}
+.mmh3-pkg-row .mmh3-pkg-x {
+  display: none;
+  position: absolute;
+  top: 7px;
+  right: 7px;
+}
+.mmh3-pkg-preview {
   flex: none;
-  width: 84px;
-  height: 44px;
+  width: 128px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.mmh3-pkg-vthumb {
+  width: 128px;
+  height: 72px;
   object-fit: contain;
   border-radius: 6px;
   background: #000;
 }
-.mmh3-package-badge {
-  flex: none;
-  min-width: 52px;
-  height: 20px;
-  box-sizing: border-box;
-  padding: 0 8px;
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
-  font-size: 11px;
-  line-height: 20px;
-  text-align: center;
-}
-.mmh3-package-info {
+.mmh3-pkg-info {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
-.mmh3-package-info-row {
-  min-width: 0;
+.mmh3-pkg-rowtop {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.mmh3-package-name {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  opacity: 0.82;
+  padding-right: 24px;
 }
-.mmh3-package-role {
-  min-width: 0;
-  max-width: 220px;
-  height: 24px;
-  border: 1px solid var(--border-color, #525a68);
-  border-radius: 8px;
-  background: var(--comfy-input-bg, #262a32);
-  color: var(--input-text, #d5d8de);
-  padding: 0 6px;
-}
-.mmh3-package-duration {
+.mmh3-pkg-rowtop .mmh3-pkg-chip {
+  position: static;
   flex: none;
-  opacity: 0.8;
+  background: var(--pkg-raised);
 }
-.mmh3-package-note {
-  width: 100%;
-  min-width: 0;
-  height: 24px;
-  box-sizing: border-box;
-  border: 1px solid var(--border-color, #525a68);
-  border-radius: 8px;
-  background: var(--comfy-input-bg, #262a32);
-  color: var(--input-text, #d5d8de);
-  padding: 0 6px;
-}
-.mmh3-package-remove {
+.mmh3-pkg-duration {
   flex: none;
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--border-color, #525a68);
-  border-radius: 8px;
-  background: var(--comfy-input-bg, #262a32);
-  color: var(--input-text, #d5d8de);
-  cursor: pointer;
+  font-size: 10px;
+  color: var(--pkg-dim);
 }
-.mmh3-audio-item {
+.mmh3-pkg-audio {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
 }
-.mmh3-audio-play {
+.mmh3-pkg-play {
   flex: none;
-  min-width: 52px;
-  min-height: 26px;
-  border: 1px solid var(--border-color, #525a68);
-  border-radius: 8px;
-  background: var(--comfy-input-bg, #262a32);
-  color: var(--input-text, #d5d8de);
-  cursor: pointer;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--pkg-c-audios);
+  color: var(--pkg-c-audios);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
-.mmh3-audio-wave {
-  display: block;
+.mmh3-pkg-play:hover:not(:disabled) {
+  background: rgba(183, 140, 240, 0.12);
+}
+.mmh3-pkg-play:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.mmh3-pkg-wave {
+  flex: 1;
   min-width: 0;
-}
-.mmh3-audio-duration {
-  flex: none;
-  opacity: 0.8;
+  display: block;
 }
 `;
 document.head.appendChild(style);
@@ -189,6 +358,18 @@ const LIMITS = {
 const DURATIONS = {
   video: { min: 2, max: 15, total: 15 },
   audio: { min: 2, max: 15, total: 15 },
+};
+
+const KIND_COLORS = {
+  images: "var(--pkg-c-images)",
+  videos: "var(--pkg-c-videos)",
+  audios: "var(--pkg-c-audios)",
+};
+
+const KIND_PREFIX = {
+  images: "Picture",
+  videos: "Video",
+  audios: "Audio",
 };
 
 const ROLE_OPTIONS = {
@@ -221,6 +402,26 @@ const DEFAULT_ROLE = {
   videos: "reference_video",
   audios: "reference_audio",
 };
+
+const ICONS = {
+  close: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  play: '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+  pause: '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>',
+  image: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>',
+  video: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m10 9 5 3-5 3z" fill="currentColor" stroke="none"/></svg>',
+  audio: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+};
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
 
 function normalizeItem(item, kind) {
   return {
@@ -296,7 +497,7 @@ async function drawWaveform(item, canvas) {
       const context = new (window.AudioContext || window.webkitAudioContext)();
       const decoded = await context.decodeAudioData(buffer);
       const channel = decoded.getChannelData(0);
-      const buckets = 48;
+      const buckets = 64;
       const block = Math.max(1, Math.floor(channel.length / buckets));
       peaks = [];
       for (let i = 0; i < buckets; i++) {
@@ -311,14 +512,14 @@ async function drawWaveform(item, canvas) {
       item._peaks = peaks;
       await context.close();
     } catch (error) {
-      peaks = Array(48).fill(0.18);
+      peaks = Array(64).fill(0.18);
       item._peaks = peaks;
     }
   }
 
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#4f9cf7";
+  ctx.fillStyle = "#b78cf0";
   const barWidth = Math.max(2, canvas.width / peaks.length - 2);
   peaks.forEach((peak, index) => {
     const height = Math.max(2, peak * canvas.height);
@@ -326,96 +527,14 @@ async function drawWaveform(item, canvas) {
   });
 }
 
-function makePreview(item, kind) {
-  if (kind === "images") {
-    const img = document.createElement("img");
-    img.className = "mmh3-package-thumb";
-    img.src = mediaUrl(item.name);
-    img.alt = "";
-    img.onerror = () => {
-      img.remove();
-    };
-    return img;
-  }
-  if (kind === "videos") {
-    const video = document.createElement("video");
-    video.className = "mmh3-package-thumb";
-    video.src = mediaUrl(item.name);
-    video.muted = true;
-    video.controls = true;
-    video.preload = "metadata";
-    return video;
-  }
-
-  const row = document.createElement("div");
-  const play = document.createElement("button");
-  const canvas = document.createElement("canvas");
-  const durationLabel = document.createElement("span");
-  const audio = new Audio(mediaUrl(item.name));
-
-  row.className = "mmh3-audio-item";
-  play.className = "mmh3-audio-play";
-  play.textContent = "Play";
-  canvas.className = "mmh3-audio-wave";
-  durationLabel.className = "mmh3-audio-duration";
-
-  const duration = Number(item.duration || 0);
-  const ratio = Math.min(1, Math.max(0, (duration - DURATIONS.audio.min) / (DURATIONS.audio.max - DURATIONS.audio.min)));
-  const cssWidth = Math.round(120 + ratio * 220);
-  canvas.style.width = `${cssWidth}px`;
-  canvas.style.height = "46px";
-  canvas.width = cssWidth * 2;
-  canvas.height = 92;
-  durationLabel.textContent = duration ? `${duration.toFixed(1)}s` : "";
-
-  audio.preload = "metadata";
-  item._audio = audio;
-  play.onclick = () => {
-    if (audio.paused) {
-      audio.play();
-      play.textContent = "Pause";
-    } else {
-      audio.pause();
-      play.textContent = "Play";
-    }
-  };
-  audio.onended = () => {
-    play.textContent = "Play";
-  };
-  audio.onerror = () => {
-    play.disabled = true;
-  };
-
-  drawWaveform(item, canvas);
-  row.append(play, canvas, durationLabel);
-  return row;
+function makeChip(kind, item, index) {
+  const chip = el("span", `mmh3-pkg-chip k-${kind}`,
+    (item.label || `<${KIND_PREFIX[kind]} ${index + 1}>`).replace(/[<>]/g, ""));
+  return chip;
 }
 
-function makeInfo(item, kind, index, onRoleChange) {
-  const info = document.createElement("div");
-  const rowTop = document.createElement("div");
-  const badge = document.createElement("span");
-  const name = document.createElement("span");
-  const rowBottom = document.createElement("div");
+function makeRoleSelect(kind, item, onChange) {
   const role = document.createElement("select");
-  const duration = document.createElement("span");
-  const note = document.createElement("input");
-  const prefix = kind === "images" ? "Picture" : kind === "videos" ? "Video" : "Audio";
-
-  info.className = "mmh3-package-info";
-  rowTop.className = "mmh3-package-info-row";
-  rowBottom.className = "mmh3-package-info-row";
-  badge.className = "mmh3-package-badge";
-  name.className = "mmh3-package-name";
-  role.className = "mmh3-package-role";
-  duration.className = "mmh3-package-duration";
-  note.className = "mmh3-package-note";
-
-  badge.textContent = item.label || `${prefix} ${index + 1}`;
-  name.textContent = item.filename || item.name || "";
-  name.title = item.name || "";
-  duration.textContent = item.duration ? `${Number(item.duration).toFixed(1)}s` : "";
-
   ROLE_OPTIONS[kind].forEach(([value, label]) => {
     const option = document.createElement("option");
     option.value = value;
@@ -425,19 +544,28 @@ function makeInfo(item, kind, index, onRoleChange) {
   role.value = item.role;
   role.onchange = () => {
     item.role = role.value;
-    onRoleChange();
+    onChange();
   };
+  return role;
+}
+
+function makeNoteInput(item, onChange) {
+  const note = document.createElement("input");
   note.placeholder = "Optional note";
   note.value = item.note || "";
   note.onchange = () => {
     item.note = note.value.trim();
-    onRoleChange();
+    onChange();
   };
+  return note;
+}
 
-  rowTop.append(badge, name);
-  rowBottom.append(role, duration);
-  info.append(rowTop, rowBottom, note);
-  return info;
+function makeRemoveButton(onClick) {
+  const remove = el("button", "mmh3-pkg-x");
+  remove.innerHTML = ICONS.close;
+  remove.title = "Remove";
+  remove.onclick = onClick;
+  return remove;
 }
 
 function setupPackageData(node) {
@@ -448,88 +576,36 @@ function setupPackageData(node) {
   }
 
   let data = parsePackage(node.properties.package_data);
-  const root = document.createElement("div");
-  const fileInput = document.createElement("input");
-  const sections = {};
+  let activeTab = "images";
 
+  const root = el("div", "mmh3-pkg-root");
+  const tabbar = el("div", "mmh3-pkg-tabs");
+  const content = el("div", "mmh3-pkg-content");
+  const fileInput = document.createElement("input");
   fileInput.type = "file";
   fileInput.style.display = "none";
-  root.className = "mmh3-package-root";
 
-  const makeSection = (kind, title) => {
-    const section = document.createElement("div");
-    const header = document.createElement("div");
-    const titleEl = document.createElement("span");
-    const count = document.createElement("span");
-    const button = document.createElement("button");
-    const list = document.createElement("div");
+  const tabButtons = {};
+  ["images", "videos", "audios"].forEach((kind) => {
+    const button = el("button", `mmh3-pkg-tab k-${kind}`);
+    const dot = el("span", "mmh3-pkg-dot");
+    const title = el("span", "tt", kind === "images" ? "Images" : kind === "videos" ? "Videos" : "Audio");
+    const count = el("span", "mmh3-pkg-tab-count");
+    button.append(dot, title, count);
+    button.onclick = () => {
+      activeTab = kind;
+      renderTabs();
+      renderContent();
+    };
+    tabButtons[kind] = { button, count };
+    tabbar.append(button);
+  });
+  const spacer = el("div", "mmh3-pkg-spacer");
+  const addButton = el("button", "mmh3-pkg-add");
+  tabbar.append(spacer, addButton);
+  root.append(tabbar, content, fileInput);
 
-    section.className = "mmh3-package-section";
-    header.className = "mmh3-package-section-header";
-    titleEl.className = "mmh3-package-section-title";
-    count.className = "mmh3-package-section-count";
-    button.className = "mmh3-package-section-button";
-    list.className = "mmh3-package-list";
-
-    titleEl.textContent = title;
-    button.textContent = kind === "images" ? "Add Image" : kind === "videos" ? "Add Video" : "Add Audio";
-    button.onclick = () => pickFile(kind);
-
-    list.dataset.kind = kind;
-    header.append(titleEl, count, button);
-    section.append(header, list);
-    sections[kind] = { section, list, count, button };
-    return section;
-  };
-
-  root.append(
-    makeSection("images", "Images"),
-    makeSection("videos", "Videos"),
-    makeSection("audios", "Audio"),
-    fileInput,
-  );
-
-  const render = () => {
-    for (const kind of ["images", "videos", "audios"]) {
-      const prefix = kind === "images" ? "Picture" : kind === "videos" ? "Video" : "Audio";
-      let nextLabel = 1;
-      for (const item of data[kind]) {
-        const match = String(item.label || "").match(new RegExp(`^<${prefix} (\\d+)>$`));
-        if (match) {
-          nextLabel = Math.max(nextLabel, Number(match[1]) + 1);
-        }
-      }
-      data[kind].forEach((item, index) => {
-        if (!item.label) {
-          item.label = `<${prefix} ${nextLabel}>`;
-          nextLabel += 1;
-        }
-      });
-      const items = data[kind].map((item, index) => {
-        const wrapper = document.createElement("div");
-        const remove = document.createElement("button");
-
-        wrapper.className = "mmh3-package-item";
-        wrapper.title = item.name || "";
-        remove.className = "mmh3-package-remove";
-        remove.textContent = "x";
-        remove.onclick = () => {
-          item._audio?.pause();
-          data[kind].splice(index, 1);
-          render();
-        };
-        wrapper.append(
-          makePreview(item, kind),
-          makeInfo(item, kind, index, render),
-          remove,
-        );
-        return wrapper;
-      });
-
-      sections[kind].list.replaceChildren(...items);
-      sections[kind].count.textContent = `${data[kind].length}/${LIMITS[kind]}`;
-      sections[kind].button.disabled = data[kind].length >= LIMITS[kind];
-    }
+  const persist = () => {
     node.properties.package_data = serializePackage(data);
     syncPackage(node, data);
     api.dispatchCustomEvent("minimax-h3/package-data-changed", {
@@ -538,9 +614,159 @@ function setupPackageData(node) {
     node.graph?.setDirtyCanvas?.(true, true);
   };
 
+  const renderTabs = () => {
+    for (const kind of ["images", "videos", "audios"]) {
+      tabButtons[kind].button.classList.toggle("on", kind === activeTab);
+      tabButtons[kind].count.textContent = `${data[kind].length}/${LIMITS[kind]}`;
+    }
+    const singular = activeTab === "images" ? "Image" : activeTab === "videos" ? "Video" : "Audio";
+    addButton.textContent = `+ Add ${singular}`;
+    addButton.disabled = data[activeTab].length >= LIMITS[activeTab];
+    addButton.onclick = () => pickFile(activeTab);
+  };
+
+  const makeImageCard = (item, index) => {
+    const card = el("div", "mmh3-pkg-card");
+    card.title = item.name || "";
+    const wrap = el("div", "mmh3-pkg-thumbwrap");
+    const img = document.createElement("img");
+    img.src = mediaUrl(item.name);
+    img.alt = "";
+    img.onerror = () => img.remove();
+    wrap.append(img, makeChip("images", item, index));
+    const thumbName = el("div", "mmh3-pkg-thumbname", item.filename || item.name || "");
+    wrap.append(thumbName);
+    wrap.append(makeRemoveButton(() => {
+      data.images.splice(index, 1);
+      persist();
+      renderAll();
+    }));
+    card.append(
+      wrap,
+      makeRoleSelect("images", item, persist),
+      makeNoteInput(item, persist),
+    );
+    return card;
+  };
+
+  const makeVideoRow = (item, index) => {
+    const row = el("div", "mmh3-pkg-row");
+    row.title = item.name || "";
+    const preview = el("div", "mmh3-pkg-preview");
+    const video = document.createElement("video");
+    video.className = "mmh3-pkg-vthumb";
+    video.src = mediaUrl(item.name);
+    video.muted = true;
+    video.controls = true;
+    video.preload = "metadata";
+    preview.append(video);
+
+    const info = el("div", "mmh3-pkg-info");
+    const top = el("div", "mmh3-pkg-rowtop");
+    top.append(
+      makeChip("videos", item, index),
+      el("span", "mmh3-pkg-name", item.filename || item.name || ""),
+      el("span", "mmh3-pkg-spacer"),
+      el("span", "mmh3-pkg-duration", item.duration ? `${Number(item.duration).toFixed(1)}s` : ""),
+    );
+    info.append(top, makeRoleSelect("videos", item, persist), makeNoteInput(item, persist));
+    row.append(preview, info, makeRemoveButton(() => {
+      data.videos.splice(index, 1);
+      persist();
+      renderAll();
+    }));
+    return row;
+  };
+
+  const makeAudioRow = (item, index) => {
+    const row = el("div", "mmh3-pkg-row");
+    row.title = item.name || "";
+
+    const info = el("div", "mmh3-pkg-info");
+    const top = el("div", "mmh3-pkg-rowtop");
+    top.append(
+      makeChip("audios", item, index),
+      el("span", "mmh3-pkg-name", item.filename || item.name || ""),
+      el("span", "mmh3-pkg-spacer"),
+      el("span", "mmh3-pkg-duration", item.duration ? `${Number(item.duration).toFixed(1)}s` : ""),
+    );
+
+    const audioRow = el("div", "mmh3-pkg-audio");
+    const play = el("button", "mmh3-pkg-play");
+    play.innerHTML = ICONS.play;
+    const canvas = document.createElement("canvas");
+    canvas.className = "mmh3-pkg-wave";
+    canvas.style.height = "34px";
+    canvas.width = 640;
+    canvas.height = 68;
+    const audio = new Audio(mediaUrl(item.name));
+    audio.preload = "metadata";
+    item._audio = audio;
+    play.onclick = () => {
+      if (audio.paused) {
+        audio.play();
+        play.innerHTML = ICONS.pause;
+      } else {
+        audio.pause();
+        play.innerHTML = ICONS.play;
+      }
+    };
+    audio.onended = () => {
+      play.innerHTML = ICONS.play;
+    };
+    audio.onerror = () => {
+      play.disabled = true;
+    };
+    audioRow.append(play, canvas);
+    drawWaveform(item, canvas);
+
+    info.append(top, audioRow, makeRoleSelect("audios", item, persist), makeNoteInput(item, persist));
+    row.append(info, makeRemoveButton(() => {
+      item._audio?.pause();
+      data.audios.splice(index, 1);
+      persist();
+      renderAll();
+    }));
+    return row;
+  };
+
+  const renderContent = () => {
+    content.replaceChildren();
+    const kind = activeTab;
+    const items = data[kind];
+    if (!items.length) {
+      const empty = el("div", "mmh3-pkg-empty");
+      const singular = kind === "images" ? "image" : kind === "videos" ? "video" : "audio";
+      const icon = el("span", "icon");
+      icon.innerHTML = ICONS[kind === "images" ? "image" : kind === "videos" ? "video" : "audio"];
+      empty.append(
+        icon,
+        el("span", "", `No ${kind} yet`),
+        el("span", "hint", `Add up to ${LIMITS[kind]} ${singular} ${kind === "images" ? "files" : "clips"} as reference media`),
+      );
+      content.append(empty);
+      return;
+    }
+    if (kind === "images") {
+      const grid = el("div", "mmh3-pkg-grid");
+      items.forEach((item, index) => grid.append(makeImageCard(item, index)));
+      content.append(grid);
+    } else {
+      const rows = el("div", "mmh3-pkg-rows");
+      const maker = kind === "videos" ? makeVideoRow : makeAudioRow;
+      items.forEach((item, index) => rows.append(maker(item, index)));
+      content.append(rows);
+    }
+  };
+
+  const renderAll = () => {
+    renderTabs();
+    renderContent();
+  };
+
   const setData = (value) => {
     data = parsePackage(value);
-    render();
+    renderAll();
   };
 
   const validateTimed = (kind, duration) => {
@@ -554,7 +780,7 @@ function setupPackageData(node) {
     }
   };
 
-  const uploadFile = async (file, kind) => {
+  const uploadFile = async (file) => {
     const body = new FormData();
     body.append("image", file);
     const response = await api.fetchApi("/upload/image", { method: "POST", body });
@@ -589,9 +815,10 @@ function setupPackageData(node) {
           duration = await readDuration(file, kind.slice(0, -1));
           validateTimed(kind, duration);
         }
-        const info = await uploadFile(file, kind);
+        const info = await uploadFile(file);
         data[kind].push({ duration, role: DEFAULT_ROLE[kind], ...info });
-        render();
+        persist();
+        renderAll();
       } catch (error) {
         alert(error.message || String(error));
       } finally {
@@ -604,15 +831,17 @@ function setupPackageData(node) {
   const domWidget = node.addDOMWidget("package_data_ui", "package_data_ui", root, {
     serialize: false,
     hideOnZoom: false,
-    getMinHeight: () => 600,
-    getMaxHeight: () => 600,
+    getMinHeight: () => 480,
+    getMaxHeight: () => 480,
   });
   domWidget.computeSize = function (width) {
-    return [width, 600];
+    return [width, 480];
   };
-  node.__h3PackageState = { setData, render };
-  node.setSize?.([780, 620]);
-  render();
+  node.__h3PackageState = { setData, render: renderAll };
+  node.setSize?.([780, 500]);
+  renderAll();
+  /* re-publish after page reload so storyboard nodes can pull media labels */
+  persist();
 }
 
 app.registerExtension({

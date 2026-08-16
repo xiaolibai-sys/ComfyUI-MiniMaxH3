@@ -25,14 +25,29 @@ import torch.nn.functional as F
 
 from ..utils.stream import BlockReader
 
+try:
+    import comfy.ops as _comfy_ops
+    ops = _comfy_ops.manual_cast
+except Exception:
+    ops = nn
 
-class _Conv3dBase(nn.Conv3d):
+_VIDEO_VAE_COMPUTE_DTYPE = torch.float16
+_AUDIO_VAE_COMPUTE_DTYPE = torch.float32
+
+
+class _Conv3dBase(ops.Conv3d):
     """nn.Conv3d with the ComfyUI ``autopad='causal_zero'`` kernel-trim feature."""
 
     def forward(self, input, autopad=None):
+        weight = self.weight
+        bias = self.bias
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+            if bias is not None:
+                bias = bias.to(input.dtype)
         if autopad == "causal_zero":
-            weight = self.weight[:, :, -input.shape[2]:, :, :]
-            return F.conv3d(input, weight, self.bias, self.stride,
+            weight = weight[:, :, -input.shape[2]:, :, :]
+            return F.conv3d(input, weight, bias, self.stride,
                             self.padding, self.dilation, self.groups)
         return super().forward(input)
 
@@ -69,9 +84,6 @@ def _apply_rope_split_half(xq, xk, table):
         return torch.cat([c * x0 - s * x1, s * x0 + c * x1], dim=-1)
 
     return _rot(xq), _rot(xk)
-
-
-ops = nn
 
 
 # ===================================================================
@@ -126,7 +138,7 @@ class CausalConv3d(_Conv3dBase):
         return super().forward(x)
 
 
-class TemporalIsolatedGroupNorm(nn.GroupNorm):
+class TemporalIsolatedGroupNorm(ops.GroupNorm):
     # GroupNorm with statistics computed per frame (time merged into batch).
     def forward(self, x):
         if x.dim() == 5:
@@ -273,8 +285,8 @@ class FeedForward(nn.Module):
     def __init__(self, dim, mult=4, bias=True):
         super().__init__()
         inner_dim = dim * mult
-        self.w1 = nn.Linear(dim, inner_dim * 2, bias=bias)
-        self.w2 = nn.Linear(inner_dim, dim, bias=bias)
+        self.w1 = ops.Linear(dim, inner_dim * 2, bias=bias)
+        self.w2 = ops.Linear(inner_dim, dim, bias=bias)
 
     def forward(self, x):
         gate, x = self.w1(x).chunk(2, dim=-1)
@@ -289,8 +301,8 @@ class Attention(nn.Module):
         inner_dim = dim_head * heads
         self.norm_q = _RMSNorm(dim_head, eps=eps, elementwise_affine=False)
         self.norm_k = _RMSNorm(dim_head, eps=eps, elementwise_affine=False)
-        self.to_qkv = nn.Linear(inner_dim, inner_dim * 3, bias=bias)
-        self.to_out = nn.Linear(inner_dim, inner_dim, bias=bias)
+        self.to_qkv = ops.Linear(inner_dim, inner_dim * 3, bias=bias)
+        self.to_out = ops.Linear(inner_dim, inner_dim, bias=bias)
 
     def forward(self, x, rotary_pos_emb=None):
         batch_size, seq_len, _ = x.shape
@@ -340,7 +352,7 @@ class ViT3DDecoder(nn.Module):
         self.num_register_tokens = num_register_tokens
 
         self.pos_embed = RotaryEmbeddingND(int(dim_head * rope_dim_ratio), rope_theta, n_dim=3)
-        self.x_embedder = nn.Linear(in_channels, dim)
+        self.x_embedder = ops.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.empty(1, num_register_tokens, dim))
         # unused at inference; kept so the checkpoint loads without leftover keys
         self.register_buffer("mask_token", torch.empty(1, 1, dim))
@@ -350,8 +362,8 @@ class ViT3DDecoder(nn.Module):
              for _ in range(num_layers)]
         )
 
-        self.norm_out = nn.LayerNorm(dim, elementwise_affine=True, eps=eps)
-        self.proj_out = nn.Linear(dim, out_channels * patch_size_t * patch_size * patch_size)
+        self.norm_out = ops.LayerNorm(dim, elementwise_affine=True, eps=eps)
+        self.proj_out = ops.Linear(dim, out_channels * patch_size_t * patch_size * patch_size)
 
     def forward(self, x):
         B, C, latent_T, latent_H, latent_W = x.shape
@@ -361,7 +373,11 @@ class ViT3DDecoder(nn.Module):
         num_patches = h.shape[1]
         num_suffix = 1 + self.num_register_tokens
 
-        h = torch.cat([h, self.register_tokens.expand(B, -1, -1), torch.zeros_like(h[:, 0:1, :])], dim=1)
+        h = torch.cat([
+            h,
+            self.register_tokens.to(h.dtype).expand(B, -1, -1),
+            torch.zeros_like(h[:, 0:1, :]),
+        ], dim=1)
 
         img_ids = create_token_ids((latent_T, latent_H, latent_W), x.device, x.dtype).expand(B, -1, -1)
         suffix_ids = torch.zeros((B, num_suffix, 3), device=x.device, dtype=img_ids.dtype)
@@ -437,8 +453,8 @@ class MiniMaxH3VideoVAE(nn.Module):
             z_channels=z_channels,
             double_z=True,
         )
-        self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
-        self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
+        self.quant_conv = ops.Conv3d(z_channels * 2, 2 * embed_dim, 1)
+        self.post_quant_conv = ops.Conv3d(embed_dim, z_channels, 1)
         self.decoder = ViT3DDecoder(
             patch_size=self.vae_ratio,
             patch_size_t=self.vae_ratio_t,
@@ -647,7 +663,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         total_frames += final_overlap_frames
         return total_frames - self._decode_temporal_pad_frames(z_len, pad_tokens)
 
-    def decode_temporal(self, z):
+    def decode_temporal(self, z, output_device=None):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
         split_count = int(self.token_drop > 0) + 1
 
@@ -680,14 +696,19 @@ class MiniMaxH3VideoVAE(nn.Module):
             part_frames = part.shape[2]
             if part_frames <= 0:
                 return
+            target = (
+                torch.device(output_device)
+                if output_device is not None
+                else part.device
+            )
             if dec is None:
                 out_shape = list(part.shape)
                 out_shape[2] = output_frames
-                dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
+                dec = torch.empty(out_shape, dtype=part.dtype, device=target)
             copy_frames = min(part_frames, max(0, dec.shape[2] - write_pos))
             if copy_frames > 0:
                 dec[:, :, write_pos:write_pos + copy_frames, :, :].copy_(
-                    part[:, :, :copy_frames, :, :]
+                    part[:, :, :copy_frames, :, :].to(target)
                 )
                 write_pos += copy_frames
 
@@ -728,7 +749,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         if x.ndim == 4:
             x = x.unsqueeze(2)
 
-        x = x.to(self.quant_conv.weight.dtype)
+        x = x.to(_VIDEO_VAE_COMPUTE_DTYPE)
         x = x.add(1.0).mul_(0.5).sub_(self.pixel_mean.to(x)).div_(self.pixel_std.to(x))
 
         if x.shape[2] == 1:
@@ -739,8 +760,8 @@ class MiniMaxH3VideoVAE(nn.Module):
 
         mean = torch.chunk(moments.float(), 2, dim=1)[0]
 
-        latents_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(mean)
-        latents_std = self.latents_std.view(1, -1, 1, 1, 1).to(mean)
+        latents_mean = self.latents_mean.float().view(1, -1, 1, 1, 1).to(mean)
+        latents_std = self.latents_std.float().view(1, -1, 1, 1, 1).to(mean)
         return (mean - latents_mean) / latents_std
 
     def encode_tiled(self, x, **kwargs):
@@ -750,18 +771,20 @@ class MiniMaxH3VideoVAE(nn.Module):
     def decode_tiled(self, z, **kwargs):
         return self.decode(z)
 
-    def decode(self, z):
+    def decode(self, z, output_device=None):
         # z: [B, 24, T_lat, H_lat, W_lat] normalized latents -> pixels [B, 3, T, H, W] in [-1, 1]
-        z = z.to(self.post_quant_conv.weight.dtype)
-        latents_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
-        latents_std = self.latents_std.view(1, -1, 1, 1, 1).to(z)
+        z = z.to(_VIDEO_VAE_COMPUTE_DTYPE)
+        latents_mean = self.latents_mean.float().view(1, -1, 1, 1, 1).to(z)
+        latents_std = self.latents_std.float().view(1, -1, 1, 1, 1).to(z)
         z = z * latents_std + latents_mean
 
         if z.shape[2] == 1:
             dec = self._adaptive_decode(z)
             dec = dec[:, :, -1:, :, :]
+            if output_device is not None:
+                dec = dec.to(torch.device(output_device))
         else:
-            dec = self.decode_temporal(z)
+            dec = self.decode_temporal(z, output_device=output_device)
 
         dec = dec.float()
         dec.mul_(self.pixel_std.to(dec)).add_(self.pixel_mean.to(dec)).clamp_(0.0, 1.0).mul_(2.0).sub_(1.0)
@@ -783,9 +806,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-ops = nn
-
 
 # Snake activations
 
@@ -925,9 +945,9 @@ class ResidualUnit(nn.Module):
         pad = ((7 - 1) * dilation) // 2
         self.block = nn.Sequential(
             Snake1d(dim),
-            nn.Conv1d(dim, dim, kernel_size=7, dilation=dilation, padding=pad),
+            ops.Conv1d(dim, dim, kernel_size=7, dilation=dilation, padding=pad),
             Snake1d(dim),
-            nn.Conv1d(dim, dim, kernel_size=1),
+            ops.Conv1d(dim, dim, kernel_size=1),
         )
 
     def forward(self, x):
@@ -946,7 +966,7 @@ class EncoderBlock(nn.Module):
             ResidualUnit(dim // 2, dilation=3),
             ResidualUnit(dim // 2, dilation=9),
             Snake1d(dim // 2),
-            nn.Conv1d(
+            ops.Conv1d(
                 dim // 2,
                 dim,
                 kernel_size=2 * stride,
@@ -962,13 +982,13 @@ class EncoderBlock(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, d_model=64, strides=(2, 4, 4, 5, 5), d_latent=2048):
         super().__init__()
-        block = [nn.Conv1d(1, d_model, kernel_size=7, padding=3)]
+        block = [ops.Conv1d(1, d_model, kernel_size=7, padding=3)]
         for stride in strides:
             d_model *= 2
             block += [EncoderBlock(d_model, stride=stride)]
         block += [
             Snake1d(d_model),
-            nn.Conv1d(d_model, d_latent, kernel_size=3, padding=1),
+            ops.Conv1d(d_model, d_latent, kernel_size=3, padding=1),
         ]
         self.block = nn.Sequential(*block)
 
@@ -981,11 +1001,11 @@ class Encoder(nn.Module):
 class GeGluMlp(nn.Module):
     def __init__(self, in_features, hidden_features):
         super().__init__()
-        self.norm = nn.LayerNorm(in_features)
+        self.norm = ops.LayerNorm(in_features)
         self.act = nn.GELU(approximate="tanh")
-        self.w0 = nn.Linear(in_features, hidden_features)
-        self.w1 = nn.Linear(in_features, hidden_features)
-        self.w2 = nn.Linear(hidden_features, in_features)
+        self.w0 = ops.Linear(in_features, hidden_features)
+        self.w1 = ops.Linear(in_features, hidden_features)
+        self.w2 = ops.Linear(hidden_features, in_features)
 
     def forward(self, x):
         x = self.norm(x)
@@ -998,11 +1018,11 @@ class CausalAttention(nn.Module):
         self.head_dim = in_dim // num_heads
         self.num_heads = num_heads
         self.out_dim = out_dim
-        self.qkv = nn.Linear(in_dim, in_dim * 3, bias=False)
+        self.qkv = ops.Linear(in_dim, in_dim * 3, bias=False)
         self.q_bias = nn.Parameter(torch.empty(in_dim))
         self.v_bias = nn.Parameter(torch.empty(in_dim))
         self.register_buffer("zero_k_bias", torch.empty(in_dim))
-        self.proj = nn.Linear(out_dim, out_dim)
+        self.proj = ops.Linear(out_dim, out_dim)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -1018,12 +1038,12 @@ class CausalAttention(nn.Module):
 class AttnProjection(nn.Module):
     def __init__(self, in_dim, out_dim, num_heads, mlp_ratio=2):
         super().__init__()
-        self.norm1 = nn.LayerNorm(in_dim)
+        self.norm1 = ops.LayerNorm(in_dim)
         self.attn = CausalAttention(in_dim, out_dim, num_heads)
-        self.proj = nn.Linear(in_dim, out_dim)
-        self.norm3 = nn.LayerNorm(in_dim)
+        self.proj = ops.Linear(in_dim, out_dim)
+        self.norm3 = ops.LayerNorm(in_dim)
 
-        self.norm2 = nn.LayerNorm(out_dim)
+        self.norm2 = ops.LayerNorm(out_dim)
         hidden_dim = int(out_dim * mlp_ratio)
         self.mlp = GeGluMlp(in_features=out_dim, hidden_features=hidden_dim)
 
@@ -1044,13 +1064,13 @@ class AMPBlock1(nn.Module):
         super().__init__()
         self.convs1 = nn.ModuleList(
             [
-                nn.Conv1d(channels, channels, kernel_size, stride=1, dilation=d, padding=get_padding(kernel_size, d))
+                ops.Conv1d(channels, channels, kernel_size, stride=1, dilation=d, padding=get_padding(kernel_size, d))
                 for d in dilation
             ]
         )
         self.convs2 = nn.ModuleList(
             [
-                nn.Conv1d(channels, channels, kernel_size, stride=1, dilation=1, padding=get_padding(kernel_size, 1))
+                ops.Conv1d(channels, channels, kernel_size, stride=1, dilation=1, padding=get_padding(kernel_size, 1))
                 for _ in range(len(dilation))
             ]
         )
@@ -1089,7 +1109,7 @@ class BigVGAN(nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
 
-        self.conv_pre = nn.Conv1d(num_mels, upsample_initial_channel, 7, 1, padding=3)
+        self.conv_pre = ops.Conv1d(num_mels, upsample_initial_channel, 7, 1, padding=3)
 
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
@@ -1114,7 +1134,7 @@ class BigVGAN(nn.Module):
                 self.resblocks.append(AMPBlock1(ch, k, d))
 
         self.activation_post = Activation1d(activation=SnakeBeta(ch))
-        self.conv_post = nn.Conv1d(ch, 1, 7, 1, padding=3, bias=False)
+        self.conv_post = ops.Conv1d(ch, 1, 7, 1, padding=3, bias=False)
 
     def forward(self, x):
         x = self.conv_pre(x)
@@ -1167,12 +1187,12 @@ class MiniMaxH3AudioVAE(nn.Module):
 
         self.pre_block = AttnProjection(latent_dim, vae_latent_channels, num_heads=8)
 
-        self.mean_proj = nn.Conv1d(vae_latent_channels, vae_latent_channels, 1)
+        self.mean_proj = ops.Conv1d(vae_latent_channels, vae_latent_channels, 1)
         # logs_proj exists in the checkpoint but is unused at inference
         # (encode returns the posterior mean, no sampling).
-        self.logs_proj = nn.Conv1d(vae_latent_channels, vae_latent_channels, 1)
+        self.logs_proj = ops.Conv1d(vae_latent_channels, vae_latent_channels, 1)
 
-        self.dec_in_proj = nn.Conv1d(vae_latent_channels, latent_dim, 1)
+        self.dec_in_proj = ops.Conv1d(vae_latent_channels, latent_dim, 1)
         self.decoder = BigVGAN(num_mels=latent_dim, upsample_initial_channel=decoder_dim)
 
         self.register_buffer("latents_mean", torch.empty(vae_latent_channels))
@@ -1181,9 +1201,9 @@ class MiniMaxH3AudioVAE(nn.Module):
     def decode(self, z):
         """Decode normalized latents [B, 32, 2, T] to stereo waveforms [B, 2, L] at 32 kHz."""
         b, c, s, t = z.shape
-        z = z.to(self.dec_in_proj.weight.dtype).permute(0, 2, 1, 3).reshape(b * s, c, t)
-        mean = self.latents_mean.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
-        std = self.latents_std.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        z = z.to(_AUDIO_VAE_COMPUTE_DTYPE).permute(0, 2, 1, 3).reshape(b * s, c, t)
+        mean = self.latents_mean.float().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        std = self.latents_std.float().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
         z = z * std + mean
         x = self.dec_in_proj(z)
         x = self.decoder(x)  # [b * s, 1, L], already clamped to [-1, 1]
@@ -1196,15 +1216,15 @@ class MiniMaxH3AudioVAE(nn.Module):
         posterior mean is used directly (no sampling).
         """
         b, s, length = waveform.shape
-        waveform = waveform.to(self.mean_proj.weight.dtype)
+        waveform = waveform.to(_AUDIO_VAE_COMPUTE_DTYPE)
         right_pad = math.ceil(length / self.hop_length) * self.hop_length - length
         waveform = F.pad(waveform, (0, right_pad))
         x = waveform.reshape(b * s, 1, -1)
         x = self.encoder(x)  # [b * s, latent_dim, T]
         x = self.pre_block(x.transpose(1, 2)).transpose(1, 2)  # [b * s, 32, T]
         z = self.mean_proj(x)
-        mean = self.latents_mean.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
-        std = self.latents_std.view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        mean = self.latents_mean.float().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
+        std = self.latents_std.float().view(1, -1, 1).to(device=z.device, dtype=z.dtype)
         z = (z - mean) / std
         return z.reshape(b, s, z.shape[1], z.shape[2]).permute(0, 2, 1, 3)
 
@@ -1213,22 +1233,81 @@ class MiniMaxH3AudioVAE(nn.Module):
 # VAE loading + handles (self-managed lifecycle)
 # ===================================================================
 
-def _bind_state_dict(module: nn.Module, sd: dict[str, torch.Tensor], prefix: str) -> None:
+class _VAEMmapStore:
+    """Keep numpy memmap views alive while VAE weights reference them."""
+
+    def __init__(self):
+        self._memmaps = []
+
+    def tensor(self, path, offset, nbytes, shape, dtype):
+        import numpy as np
+
+        try:
+            mm = np.memmap(
+                path,
+                dtype=np.uint8,
+                mode="r+",
+                offset=offset,
+                shape=(nbytes,),
+            )
+        except (PermissionError, OSError, ValueError):
+            mm = np.memmap(
+                path,
+                dtype=np.uint8,
+                mode="r",
+                offset=offset,
+                shape=(nbytes,),
+            )
+        self._memmaps.append(mm)
+        return torch.from_numpy(mm).view(dtype).reshape(tuple(shape))
+
+    def clear(self):
+        self._memmaps.clear()
+
+
+def _bind_state_dict(
+    module: nn.Module,
+    sd: dict[str, torch.Tensor],
+    prefix: str,
+    compute_dtype: torch.dtype,
+) -> None:
     """Bind checkpoint tensors into a module by exact param/buffer names."""
-    for name, p in list(module.named_parameters()):
-        key = f"{prefix}{name}"
-        if key not in sd:
-            continue
-        mod = module.get_submodule(name.rsplit(".", 1)[0]) if "." in name else module
-        leaf = name.rsplit(".", 1)[1] if "." in name else name
-        mod._parameters[leaf] = nn.Parameter(sd[key], requires_grad=False)
-    for name, b in list(module.named_buffers()):
-        key = f"{prefix}{name}"
-        if key not in sd:
-            continue
-        mod = module.get_submodule(name.rsplit(".", 1)[0]) if "." in name else module
-        leaf = name.rsplit(".", 1)[1] if "." in name else name
-        mod._buffers[leaf] = sd[key]
+    def _is_quantized_weight(mod, leaf: str) -> bool:
+        if leaf != "weight":
+            return False
+        return isinstance(mod, (
+            nn.Conv1d,
+            nn.Conv2d,
+            nn.Conv3d,
+            nn.ConvTranspose1d,
+            nn.ConvTranspose2d,
+            nn.Linear,
+        ))
+
+    for mod_name, mod in module.named_modules():
+        param_names = list(mod._parameters.keys())
+        for leaf in ("weight", "bias"):
+            if (leaf not in param_names
+                    and hasattr(mod, leaf)
+                    and getattr(mod, leaf) is None):
+                param_names.append(leaf)
+        for leaf in param_names:
+            key = f"{prefix}{mod_name}.{leaf}" if mod_name else f"{prefix}{leaf}"
+            if key not in sd:
+                continue
+            value = sd[key]
+            if not _is_quantized_weight(mod, leaf):
+                value = value.to(compute_dtype)
+            setattr(
+                mod,
+                leaf,
+                nn.Parameter(value, requires_grad=False),
+            )
+    for mod_name, mod in module.named_modules():
+        for leaf, b in list(mod._buffers.items()):
+            key = f"{prefix}{mod_name}.{leaf}" if mod_name else f"{prefix}{leaf}"
+            if key in sd:
+                setattr(mod, leaf, sd[key].to(compute_dtype))
 
 
 class VAEPack:
@@ -1237,6 +1316,7 @@ class VAEPack:
     def __init__(self, video_vae=None, audio_vae=None):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
+        self.mmap_stores = []
 
     def encode_video(self, x: torch.Tensor) -> torch.Tensor:
         assert self.video_vae is not None
@@ -1247,6 +1327,12 @@ class VAEPack:
         assert self.video_vae is not None
         device = self.video_vae.post_quant_conv.weight.device
         return self.video_vae.decode(z.to(device))
+
+    def decode_video_streaming(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode to CPU with bounded GPU peak using temporal chunking/tiling."""
+        assert self.video_vae is not None
+        device = self.video_vae.post_quant_conv.weight.device
+        return self.video_vae.decode(z.to(device), output_device="cpu")
 
     def encode_audio(self, wav: torch.Tensor) -> torch.Tensor:
         assert self.audio_vae is not None
@@ -1277,6 +1363,9 @@ class VAEPack:
                     mod._buffers[name] = torch.empty(0)
         self.video_vae = None
         self.audio_vae = None
+        for store in self.mmap_stores:
+            store.clear()
+        self.mmap_stores = []
 
 
 _vae_cache: dict[str, VAEPack] = {}
@@ -1287,6 +1376,33 @@ def _detect_vae_prefix(reader: BlockReader) -> str:
     if any(k.startswith("vae.") for k in keys):
         return "vae."
     return ""
+
+
+def _bind_mmap_or_full(
+    module,
+    reader,
+    prefix,
+    path,
+    store,
+    compute_dtype,
+):
+    keys = [k for k in reader.all_keys() if reader.has(k)]
+    try:
+        sd = {}
+        for key in keys:
+            shape, dtype = reader.get_tensor_info(key)
+            offset, nbytes = reader.get_tensor_offsets(key)
+            sd[key] = store.tensor(path, offset, nbytes, shape, dtype)
+        _bind_state_dict(module, sd, prefix, compute_dtype)
+        return True
+    except NotImplementedError:
+        _bind_state_dict(
+            module,
+            reader.get_tensors(keys),
+            prefix,
+            compute_dtype,
+        )
+        return False
 
 
 def load_vae_pack(video_path: str, audio_path: str, device=None,
@@ -1302,17 +1418,37 @@ def load_vae_pack(video_path: str, audio_path: str, device=None,
         reader = BlockReader(video_path)
         prefix = _detect_vae_prefix(reader)
         vv = MiniMaxH3VideoVAE()
-        _bind_state_dict(vv, reader.get_tensors([k for k in reader.all_keys() if reader.has(k)]), prefix)
+        store = _VAEMmapStore()
+        used_mmap = _bind_mmap_or_full(
+            vv,
+            reader,
+            prefix,
+            str(reader.path),
+            store,
+            _VIDEO_VAE_COMPUTE_DTYPE,
+        )
         reader.close()
         vv.to(device)
+        if used_mmap:
+            pack.mmap_stores.append(store)
         pack.video_vae = vv
     if audio_path:
         reader = BlockReader(audio_path)
         prefix = _detect_vae_prefix(reader)
         av = MiniMaxH3AudioVAE()
-        _bind_state_dict(av, reader.get_tensors([k for k in reader.all_keys() if reader.has(k)]), prefix)
+        store = _VAEMmapStore()
+        used_mmap = _bind_mmap_or_full(
+            av,
+            reader,
+            prefix,
+            str(reader.path),
+            store,
+            _AUDIO_VAE_COMPUTE_DTYPE,
+        )
         reader.close()
         av.to(device)
+        if used_mmap:
+            pack.mmap_stores.append(store)
         pack.audio_vae = av
     _vae_cache[cache_key] = pack
     return pack

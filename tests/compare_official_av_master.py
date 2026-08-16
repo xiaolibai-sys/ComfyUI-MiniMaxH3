@@ -102,7 +102,7 @@ official_out = official(
 
 ours_out = ours.velocity(
     video, audio_internal, sigma, text, {},
-    shift_video=shift_v, shift_audio=shift_a, official_av=True)
+    shift_video=shift_v, shift_audio=shift_a)
 ours_audio_y = (
     (1.0 - scale) * audio_internal
     + (1.0 + (scale - 1.0) * sigma_a) * ours_out[1]

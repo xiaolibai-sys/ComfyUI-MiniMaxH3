@@ -20,9 +20,9 @@ from h3rt.models.lora import (
     parse_lora_h3,
 )
 from h3rt.models.model import AdalnProj, MiniMaxH3Model
-from h3rt.nodes.h3_sampling import h3_sample
+from h3_test_utils import h3_sample
 from h3rt.utils.config import MiniMaxH3DiTConfig
-from h3rt.utils.injection import InjectionContext
+from h3rt.utils.types import RuntimeOptions
 from h3rt.utils.lifecycle import load_model_handle
 from h3rt.utils.types import (
     AVLatent,
@@ -31,6 +31,7 @@ from h3rt.utils.types import (
     H3Lora,
     H3LoraSet,
     LoraEntry,
+    TextConditioning,
 )
 
 torch.manual_seed(11)
@@ -211,14 +212,19 @@ assert getattr(m, "_lora_adaln", None) is not None
 assert mgr.blocks[0].lora is None
 
 latent = AVLatent(video=video, audio=audio)
-cond = H3Conditioning(text_states=text, text_token_tags=payload["text_token_tags"])
+cond = H3Conditioning(
+    text=TextConditioning(
+        states=text,
+        tags=payload["text_token_tags"],
+    )
+)
 res_eager = h3_sample(
     handle, cond, latent, None, 2, 1.0, "euler",
-    12.0, 1.0, 123, InjectionContext.build(block_swap_args=swap),
+    12.0, 1.0, 123, RuntimeOptions(swap=swap),
     disable_pbar=True)
 res_cached = h3_sample(
     handle, cond, latent, None, 2, 1.0, "euler",
-    12.0, 1.0, 123, InjectionContext.build(block_swap_args=swap),
+    12.0, 1.0, 123, RuntimeOptions(swap=swap),
     disable_pbar=True, use_adaln_cache=True)
 
 

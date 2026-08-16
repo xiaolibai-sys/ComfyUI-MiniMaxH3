@@ -35,7 +35,7 @@ from .block_window import _BlockWindow, _VRAMBudget
 from .disk_prefetcher import _DiskPrefetcher
 from .interrupt import check_interrupt
 from .stream import BlockReader
-from .swap_types import SwapBlock, free_module_storage
+from .types import BlockSwapStats, SwapAllocation, SwapBlock
 from .transfer_scheduler import TransferScheduler
 from .types import SlotEntry
 
@@ -364,6 +364,33 @@ class _TransferEngine:
         self._gpu_storage = raw
         self._gpu_slot_size = slot_total
 
+    def release_gpu_pool(self) -> None:
+        """Drop every GPU ring allocation after a full D2H offload.
+
+        Used before a non-DiT compute phase (VAE encode/decode) so the GPU
+        ring memory is actually returned to the allocator instead of merely
+        being unassigned.  The next ``load_block`` rebuilds the ring slots.
+        """
+        self.sync_all()
+        with self._transfer_lock:
+            if self._scheduler is not None:
+                self._scheduler.close()
+                self._scheduler = None
+            self._gpu_pool = [None] * len(self._gpu_pool)
+            self._gpu_built = [False] * len(self._gpu_built)
+            self._gpu_storage = None
+            self._gpu_slot_size = 0
+            self._block_gpu.clear()
+            self._events.clear()
+            self._gpu_h2d_events.clear()
+            self._gpu_d2h_events.clear()
+            self._gpu_cursor = 0
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def _wait_home_slot(self, hslot: int) -> None:
         """Host-wait for any in-flight async D2H into home slot *hslot*."""
         ev = self._d2h_events.pop(hslot, None)
@@ -647,12 +674,17 @@ class _TransferEngine:
     def start_prefetch(self, block_idx: int, block: SwapBlock) -> None:
         if block_idx in self._block_gpu or block_idx in self._events:
             return
+        if block_idx not in self._block_home and self.home_free_count() <= 0:
+            return
         # Pageable home slots cannot DMA asynchronously.  Background reads
         # would only add a second full block copy during compute and can
         # exhaust host memory alongside D2H home-slot allocation.
         if not self.pin_memory:
             return
-        hslot = self.ensure_home(block_idx, block, non_blocking=True)
+        try:
+            hslot = self.ensure_home(block_idx, block, non_blocking=True)
+        except RuntimeError:
+            return
         if self._home_registered.get(hslot) is not None:
             self.load_block(block_idx, block, non_blocking=True)
 
@@ -734,74 +766,46 @@ class _TransferEngine:
 
 class BlockSwapManager:
     def __init__(self, blocks: list[SwapBlock], reader: BlockReader, device,
-                 window_size: int = 2, prefetch: bool = True,
-                 prefetch_count: int = 2, pin_memory: bool = True,
-                 disk_workers: int = 2, hot_blocks: int = 0,
-                 vram_reserve_mb: float = 0.0,
-                 runtime_lora_total_mb: float = 0.0,
-                 runtime_lora_fixed_mb: float = 0.0,
+                 allocation: SwapAllocation,
+                 prefetch: bool = True,
+                 pin_memory: bool = True,
+                 disk_workers: int = 2,
                  dtype=torch.bfloat16):
+        if allocation is None:
+            raise ValueError("BlockSwapManager requires a SwapAllocation.")
         self.blocks = blocks
         self.total = len(blocks)
         self.device = torch.device(device)
         self.dtype = dtype
         self.prefetch = bool(prefetch)
-        self.window_size = max(1, min(window_size, self.total))
-        self.prefetch_count = max(1, prefetch_count)
+        pool = allocation.pool
+        self.window_size = pool.window_size
+        self.prefetch_count = pool.prefetch_count
+        self.hot_blocks = pool.hot_blocks
+        self.home_size = pool.home_slots
+        assert self.window_size >= 1, "window_size must be >= 1"
+        assert self.window_size <= self.total, "window_size exceeds block count"
+        assert self.prefetch_count >= 0, "prefetch_count must be >= 0"
+        assert (
+            self.hot_blocks <= max(0, self.window_size - 1)
+        ), "hot_blocks must fit inside window"
+        assert (
+            pool.gpu_slots >= self.window_size
+        ), "gpu_slots must cover the window"
+        assert (
+            0 <= self.home_size <= self.total
+        ), "home_slots must stay within the model block count"
         self.swap_hits = 0
         self.swap_loads = 0
-        self.home_size = max(0, self.total - self.window_size)
         self._flushed_this_step = False
-
-        block_mb = (blocks[0].bytes_per_block() / 2 ** 20) if blocks else 0.0
-        if vram_reserve_mb > 0 and block_mb > 0:
-            lora_per_slot_mb = (
-                runtime_lora_total_mb / self.total
-                if self.total > 0 else 0.0
-            )
-            effective_reserve_mb = vram_reserve_mb + runtime_lora_fixed_mb
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            free_mb = _VRAMBudget(block_mb).free_mb(self.device)
-            max_slots = max(
-                1,
-                int((free_mb - effective_reserve_mb)
-                    // (block_mb + lora_per_slot_mb)),
-            )
-            requested = self.window_size + self.prefetch_count
-            if requested > max_slots:
-                self.prefetch_count = min(
-                    self.prefetch_count, max(0, max_slots - 1))
-                self.window_size = max(
-                    1,
-                    min(self.window_size, max_slots - self.prefetch_count),
-                )
-                hot_blocks = min(
-                    hot_blocks, max(0, self.window_size - 1))
-                self.home_size = max(0, self.total - self.window_size)
-                logger.info(
-                    "blockswap: free VRAM %.0f MB after flush, "
-                    "static VRAM reserve %.0f MB "
-                    "(lora total %.1f fixed %.1f) -> "
-                    "window=%d prefetch=%d hot=%d",
-                    free_mb, effective_reserve_mb, runtime_lora_total_mb,
-                    runtime_lora_fixed_mb, self.window_size,
-                    self.prefetch_count, hot_blocks)
-
-        self.hot_blocks = max(0, min(hot_blocks, self.total))
+        block_mb = pool.block_mb
         self._window = _BlockWindow(
             self.total, self.window_size, hot_blocks=self.hot_blocks)
         self.hot_blocks = len(self._window.hot)
+
         self._disk = _DiskPrefetcher(reader, blocks, max_workers=disk_workers)
         self._xfer = _TransferEngine(
-            device, prefetch, prefetch_count, pin_memory,
+            device, prefetch, self.prefetch_count, pin_memory,
             n_home_slots=max(self.home_size, 1),
             n_gpu_slots=self.window_size + self.prefetch_count,
             home=self._disk,
@@ -921,6 +925,56 @@ class BlockSwapManager:
         if self._xfer.offload_block(block_idx, self.blocks[block_idx]):
             self._window.mark_offloaded(block_idx)
 
+    def offload_all(self) -> None:
+        """Move every resident GPU block home and release the GPU ring.
+
+        This is the DIT side of a rolling VAE phase: the window/hot blocks are
+        written back to their home slots and the preallocated CUDA ring storage
+        is freed so VAE weights can occupy the GPU alone.
+        """
+        if self.total == 0:
+            return
+        self._xfer.sync_all()
+        resident = sorted(self._window.on_gpu)
+        prefetch = sorted(set(self._xfer._block_gpu) - set(resident))
+        if not resident and not prefetch:
+            self._xfer.release_gpu_pool()
+            return
+        for idx in prefetch:
+            self._xfer.discard_block(idx)
+        moved = 0
+        for idx in resident:
+            if self._xfer.offload_block(idx, self.blocks[idx], force=True):
+                self._window.mark_offloaded(idx)
+                moved += 1
+        if moved < len(resident):
+            logger.warning(
+                "blockswap: partial DIT offload for VAE phase "
+                "(%d/%d moved); keeping GPU ring allocated",
+                moved, len(resident),
+            )
+            self._xfer.sync_all()
+            return
+        self._xfer.sync_all()
+        self._window.clear()
+        self._xfer.release_gpu_pool()
+
+    def restore_initial(self) -> None:
+        """Reload the first block window after a VAE phase."""
+        if self.total == 0:
+            return
+        needed = set(range(0, min(self.total, self.window_size)))
+        needed |= self._window.hot
+        for idx in sorted(set(self._xfer._block_home) - needed):
+            hslot = self._xfer._block_home.pop(idx, None)
+            if hslot is None:
+                continue
+            self._xfer._wait_home_slot(hslot)
+            self._xfer._home.wait_home_fill(hslot)
+            self._xfer._home.release(idx)
+            self._xfer._release_home(hslot)
+        self.prepare(0)
+
     def prefetch_next(self, block_idx: int) -> None:
         """Prefetch blocks just beyond the window.
 
@@ -941,6 +995,11 @@ class BlockSwapManager:
         for i in range(start, end):
             if self._window.is_on_gpu(i):
                 continue
+            if (
+                i not in self._xfer._block_home
+                and self._xfer.home_free_count() <= 0
+            ):
+                break
             self._xfer.start_prefetch(i, self.blocks[i])
 
     def end(self) -> None:
@@ -977,13 +1036,20 @@ class BlockSwapManager:
         except Exception:
             pass
 
-    def stats(self) -> dict:
-        return {"hits": self.swap_hits, "loads": self.swap_loads,
-                "home_size": self.home_size, "total": self.total,
-                "window": self.window_size, "hot": self.hot_blocks,
-                "disk_reads": self._disk.disk_reads,
-                "d2h_stage": self._xfer.d2h_stage_hits,
-                "d2h_sync": self._xfer.d2h_sync_fallback}
+    def stats(self) -> BlockSwapStats:
+        return BlockSwapStats(
+            swap_hits=self.swap_hits,
+            swap_loads=self.swap_loads,
+            home_size=self.home_size,
+            total=self.total,
+            window=self.window_size,
+            hot=self.hot_blocks,
+            disk_reads=self._disk.disk_reads,
+            d2h_stage=self._xfer.d2h_stage_hits,
+            d2h_direct=0,
+            d2h_host_register=0,
+            d2h_sync=self._xfer.d2h_sync_fallback,
+        )
 
     # -- internal ------------------------------------------------------------
 

@@ -27,8 +27,16 @@ import torch
 
 from .config import MiniMaxH3DiTConfig
 from .stream import BlockReader
-from .blockswap import BlockSwapManager, SwapBlock, free_module_storage
-from .types import H3BlockSwap, H3LoraSet, SlotEntry
+from .blockswap import BlockSwapManager
+from .swap_types import free_module_storage
+from .types import (
+    H3BlockSwap,
+    H3LoraSet,
+    PoolPlan,
+    SlotEntry,
+    SwapAllocation,
+    SwapBlock,
+)
 from ..models import quant
 
 _MAX_MODEL_CACHE = 1
@@ -190,7 +198,10 @@ def _bind_periphery(module, reader, prefix, device, dtype,
 
 def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
               swap: H3BlockSwap, include_adaln: bool = True,
-              adaln_override=None
+              adaln_override=None,
+              vram_spec=None,
+              vram_backend: str = "sageattn2",
+              vram_loras=None,
               ) -> tuple["MiniMaxH3Model", BlockSwapManager, str]:
     from ..models.model import MiniMaxH3Model
     config = scan_dit_config(reader, MiniMaxH3DiTConfig())
@@ -256,17 +267,38 @@ def build_dit(reader: BlockReader, dtype: torch.dtype, device: torch.device,
                                 refs=refs, templates=templates,
                                 overrides=overrides))
 
+    block_mb = (blocks[0].bytes_per_block() / 2 ** 20) if blocks else 0.0
+    if vram_spec is not None:
+        from .vram_planner import VRAMPlanner
+        planner = VRAMPlanner(vram_backend, device, vram_loras)
+        allocation = planner.plan(
+            swap, block_mb, vram_spec, config.num_layers)
+    else:
+        window = swap.window_size(config.num_layers)
+        pool = PoolPlan(
+            block_mb=block_mb,
+            free_mb=0.0,
+            effective_reserve_mb=swap.vram_reserve_mb,
+            lora_per_slot_mb=0.0,
+            max_slots=window + swap.prefetch_count,
+            requested_slots=window + swap.prefetch_count,
+            window_size=window,
+            hot_blocks=min(swap.hot_blocks, window - 1),
+            prefetch_count=swap.prefetch_count,
+            home_slots=(
+                min(config.num_layers, max(1, window))
+                if swap.offload_dit
+                else max(0, config.num_layers - window)
+            ),
+            gpu_slots=window + swap.prefetch_count,
+        )
+        allocation = SwapAllocation(config=swap, pool=pool)
     mgr = BlockSwapManager(
         blocks, reader, device,
-        window_size=swap.window_size(config.num_layers),
         prefetch=swap.prefetch,
-        prefetch_count=swap.prefetch_count,
-        hot_blocks=swap.hot_blocks,
         pin_memory=swap.pin_memory,
         disk_workers=swap.disk_workers,
-        vram_reserve_mb=swap.vram_reserve_mb,
-        runtime_lora_total_mb=swap.runtime_lora_total_mb,
-        runtime_lora_fixed_mb=swap.runtime_lora_fixed_mb,
+        allocation=allocation,
         dtype=dtype,
     )
     model._swap_mgr = mgr
@@ -285,7 +317,11 @@ def run_token_refiner(model: MiniMaxH3Model, reader: BlockReader, text_states: t
         x = model.condition_proj(text_states[0].to(dtype))
     else:
         x = text_states[0].to(dtype)
+    loaded = bool(getattr(model, "_token_refiner_loaded", False))
     for i, blk in enumerate(model.token_refiner.blocks):
+        if loaded:
+            x = blk(x)
+            continue
         keys, refs = [], []
         for pname, p in blk.named_parameters():
             key = f"{prefix}token_refiner.blocks.{i}.{pname}"
@@ -308,12 +344,12 @@ def run_token_refiner(model: MiniMaxH3Model, reader: BlockReader, text_states: t
             from ..models.lora import fold_lora_into_module
             fold_lora_into_module(blk, lora_entries)
         x = blk(x)
-        for mod, leaf in refs:
-            mod._parameters[leaf] = torch.nn.Parameter(torch.empty((0,), dtype=dtype), requires_grad=False)
-    norm_key = f"{prefix}token_refiner.final_norm.weight"
-    if reader.has(norm_key):
-        model.token_refiner.final_norm.weight = torch.nn.Parameter(
-            reader.get_tensors([norm_key])[norm_key].to(device, dtype), requires_grad=False)
+    if not loaded:
+        norm_key = f"{prefix}token_refiner.final_norm.weight"
+        if reader.has(norm_key):
+            model.token_refiner.final_norm.weight = torch.nn.Parameter(
+                reader.get_tensors([norm_key])[norm_key].to(device, dtype), requires_grad=False)
+        model._token_refiner_loaded = True
     return model.token_refiner.final_norm(x).unsqueeze(0)
 
 
@@ -323,14 +359,21 @@ def run_token_refiner(model: MiniMaxH3Model, reader: BlockReader, text_states: t
 
 def _cache_key(path: str, swap: H3BlockSwap, attn_backend=None,
                include_adaln: bool = True,
-               loras: Optional[H3LoraSet] = None) -> str:
+               loras: Optional[H3LoraSet] = None,
+               vram_spec=None) -> str:
     lora_sig = loras.signature() if loras else None
+    vram_tokens = None
+    if vram_spec is not None:
+        from .vram_models import sequence_token_count
+        vram_tokens = sequence_token_count(vram_spec)
     raw = json.dumps(dict(path=path, block_to_swap=swap.block_to_swap, prefetch=swap.prefetch,
                           prefetch_count=swap.prefetch_count, pin=swap.pin_memory,
                           hot_blocks=swap.hot_blocks, workers=swap.disk_workers,
                           vram_reserve=swap.vram_reserve_mb,
                           runtime_lora_total=swap.runtime_lora_total_mb,
                           runtime_lora_fixed=swap.runtime_lora_fixed_mb,
+                          offload_dit=swap.offload_dit,
+                          vram_tokens=vram_tokens,
                           dtype=swap.dtype, enabled=swap.enabled,
                           include_adaln=include_adaln,
                           lora=lora_sig,
@@ -372,6 +415,8 @@ class ModelHandle:
         self.include_adaln = True
         self.attn_backend = attn_backend
         self.loras: H3LoraSet = H3LoraSet()
+        self.vram_spec = None
+        self._vram_tokens = None
         self._model: Optional[MiniMaxH3Model] = None
         self._swap_mgr: Optional[BlockSwapManager] = None
         self._reader: Optional[BlockReader] = None
@@ -384,7 +429,7 @@ class ModelHandle:
 
     def _cache_key(self) -> str:
         return _cache_key(self.model_path, self.swap, self.attn_backend,
-                          self.include_adaln, self.loras)
+                          self.include_adaln, self.loras, self.vram_spec)
 
     def _cache_evict_self(self) -> None:
         with _cache_lock:
@@ -420,16 +465,25 @@ class ModelHandle:
     # -- lifecycle -------------------------------------------------------------
 
     def load(self, swap_config: Optional[H3BlockSwap] = None,
-             include_adaln: bool = True):
+             include_adaln: bool = True,
+             vram_spec=None):
         swap = swap_config if swap_config is not None else self.swap
+        vram_tokens = None
+        if vram_spec is not None:
+            from .vram_models import sequence_token_count
+            vram_tokens = sequence_token_count(vram_spec)
         if self._model is not None:
-            if swap == self.swap and self.include_adaln == include_adaln:
+            if (swap == self.swap
+                    and self.include_adaln == include_adaln
+                    and vram_tokens == self._vram_tokens):
                 return self._model
             # swap layout changed: tear down and rebuild with the new window
             self.unload()
         self.swap = swap
         self.dtype = swap.torch_dtype
         self.include_adaln = include_adaln
+        self.vram_spec = vram_spec
+        self._vram_tokens = vram_tokens
         if self._cache_hit():
             return self._model  # type: ignore[return-value]
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -438,7 +492,10 @@ class ModelHandle:
             model, mgr, _ = build_dit(
                 self._reader, self.dtype, device, self.swap,
                 include_adaln=include_adaln,
-                adaln_override=self.loras.adaln_override if self.loras else None)
+                adaln_override=self.loras.adaln_override if self.loras else None,
+                vram_spec=vram_spec,
+                vram_backend=getattr(self, "attn_backend_name", "sageattn2"),
+                vram_loras=self.loras)
             if self.attn_backend is not None:
                 model.set_attn_backend(self.attn_backend)
             self._model, self._swap_mgr = model, mgr
@@ -461,13 +518,35 @@ class ModelHandle:
 
     def preprocess_text(self, text_states: torch.Tensor,
                         include_adaln: bool = True) -> torch.Tensor:
-        model = self.load(include_adaln=include_adaln)
+        model = self._model
+        if model is None or self.include_adaln != include_adaln:
+            model = self.load(include_adaln=include_adaln)
         cfg = model._config
         if text_states.shape[-1] == cfg.hidden_size:
             return text_states
         assert self._reader is not None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return run_token_refiner(model, self._reader, text_states, device, self.dtype)
+
+    def release_token_refiner(self) -> None:
+        """Drop token-refiner weights after all text states are refined."""
+        model = self._model
+        if model is None:
+            return
+        dtype = self.dtype
+        for blk in model.token_refiner.blocks:
+            for pname, _p in blk.named_parameters():
+                mod = (
+                    blk.get_submodule(pname.rsplit(".", 1)[0])
+                    if "." in pname
+                    else blk
+                )
+                leaf = pname.rsplit(".", 1)[1] if "." in pname else pname
+                mod._parameters[leaf] = torch.nn.Parameter(
+                    torch.empty((0,), dtype=dtype), requires_grad=False)
+        model.token_refiner.final_norm.weight = torch.nn.Parameter(
+            torch.empty((0,), dtype=dtype), requires_grad=False)
+        model._token_refiner_loaded = False
 
     def _apply_lora(self, model, mgr) -> None:
         loras = self.loras

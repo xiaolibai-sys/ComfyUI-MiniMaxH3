@@ -30,12 +30,6 @@ class LoadingMode(str, Enum):
     FULL = "Full"             # load every block to VRAM once and keep resident
 
 
-class SwapMode(str, Enum):
-    """BlockSwap residency strategy for the DiT blocks."""
-    RING_BUFFER = "ring_buffer"   # fixed GPU ring pool + pinned CPU home pool + disk prefetch
-    NONE = "none"                 # no swap (Full loading)
-
-
 class CondKind(str, Enum):
     """Modality tag of a packed-sequence segment (matches the DiT layout)."""
     TEXT = "text"
@@ -91,13 +85,13 @@ class H3BlockSwap:
     hot_blocks: int = 0                 # leading DiT blocks kept resident on GPU
     prefetch: bool = True               # disk -> RAM prefetch of the next window
     prefetch_count: int = 2             # home slots read ahead from disk
-    pin_memory: bool = True             # pinned CPU staging; only the small prefetch/stage pools are pinned (home stays pageable), so the locked footprint is tiny and Windows-safe
+    pin_memory: bool = True             # pinned CPU staging
     disk_workers: int = 2               # background reader threads
     auto_vram: bool = True              # estimate reserve/runtime LoRA before pool allocation
     vram_reserve_mb: float = 0.0        # non-weight VRAM reserved before block pool allocation
     runtime_lora_total_mb: float = 0.0  # runtime LoRA A/B bytes shared across all 50 blocks
     runtime_lora_fixed_mb: float = 0.0  # AdaLN/final/token-refiner runtime LoRA fixed bytes
-    loading_mode: str = LoadingMode.STREAMING.value
+    offload_dit: bool = False           # rolling VAE phase: keep a small RAM home pool
     dtype: str = "bfloat16"             # bfloat16 | float16 | float32
 
     def window_size(self, total_blocks: int) -> int:
@@ -154,6 +148,14 @@ class EncoderStreamConfig:
         )
 
 
+@dataclass(frozen=True)
+class VAERef:
+    """Paths only; the pack is loaded lazily (and cached) by decode/sample nodes."""
+
+    video_path: str
+    audio_path: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Attention backend config
 # ---------------------------------------------------------------------------
@@ -163,8 +165,6 @@ class AttentionConfig:
     """Attention backend selection (mirrors BerniniR_AttentionConfig)."""
     backend: str = "sageattn2"
     force_backend: bool = False
-    available: tuple = ()
-    best: str = "sdpa_math"
 
     def make_override(self):
         from ..attention.backends import create_attention_override
@@ -271,6 +271,29 @@ class SlotEntry:
             module._parameters[leaf] = torch.nn.Parameter(
                 self.data, requires_grad=False)
 
+
+@dataclass
+class SwapBlock:
+    """One swappable weight group (a DiT block)."""
+
+    name: str
+    module: torch.nn.Module
+    keys: list[str] = field(default_factory=list)
+    names: list[str] = field(default_factory=list)
+    refs: list[tuple[torch.nn.Module, str, str]] = field(default_factory=list)
+    templates: list[SlotEntry] = field(default_factory=list)
+    lora: Optional[list] = None
+    overrides: dict = field(default_factory=dict)
+
+    def bytes_per_block(self) -> int:
+        total = 0
+        for t in self.templates:
+            total += t.data.numel() * t.data.element_size()
+            if t.scale is not None:
+                total += t.scale.numel() * t.scale.element_size()
+            for e in t.extra.values():
+                total += e.numel() * e.element_size()
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -394,34 +417,106 @@ class H3LoraSet:
 # Conditioning payload (consumed by the sampler)
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class TextConditioning:
+    """Qwen hidden states plus per-token modality tags."""
+
+    states: torch.Tensor       # [1, L, text_dim]
+    tags: torch.Tensor         # [1, L]
+
+
+@dataclass(frozen=True)
+class KeyframeCondition:
+    """One FL2VA keyframe latent anchored at a resolved frame index."""
+
+    resolved_frame_index: int
+    latent: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ReferenceCondition:
+    """One ref2va image/video/audio reference block."""
+
+    kind: str                                  # image | video | video_audio | audio
+    latent: Optional[torch.Tensor] = None
+    latent_t: int = 0
+    latent_h: int = 0
+    latent_w: int = 0
+    ref_audio_t: int = 0
+    audio_latent: Optional[torch.Tensor] = None
+
+    def to_payload(self) -> dict:
+        payload = {"kind": self.kind}
+        if self.latent_h or self.latent_w:
+            payload["latent_h"] = self.latent_h
+            payload["latent_w"] = self.latent_w
+        if self.latent is not None:
+            payload["latent"] = self.latent
+        if self.latent_t:
+            payload["latent_t"] = self.latent_t
+        if self.ref_audio_t:
+            payload["ref_audio_t"] = self.ref_audio_t
+        if self.audio_latent is not None:
+            payload["audio_latent"] = self.audio_latent
+        return payload
+
+
+@dataclass(frozen=True)
+class MediaConditioning:
+    """Media anchors carried alongside text conditioning."""
+
+    keyframes: tuple[KeyframeCondition, ...] = ()
+    refs: tuple[ReferenceCondition, ...] = ()
+    frame_count: Optional[int] = None
+
+    def to_payload(self) -> dict:
+        payload: dict = {}
+        if self.keyframes:
+            payload["keyframes"] = [
+                {
+                    "resolved_frame_index": kf.resolved_frame_index,
+                    "latent": kf.latent,
+                }
+                for kf in self.keyframes
+            ]
+            payload["frame_count"] = self.frame_count
+            payload["cond_video_latents"] = [
+                kf.latent for kf in self.keyframes
+            ]
+        if self.refs:
+            payload["refs"] = [r.to_payload() for r in self.refs]
+            payload["cond_video_latents"] = [
+                r.latent for r in self.refs if r.latent is not None
+            ]
+            payload["cond_audio_latents"] = [
+                r.audio_latent for r in self.refs
+                if r.audio_latent is not None
+            ]
+        return payload
+
+
 @dataclass
 class H3Conditioning:
-    """Everything the DiT forward needs besides the AV latents."""
-    text_states: torch.Tensor            # [1, L, text_dim] (unnormalized, layer 50)
-    text_token_tags: torch.Tensor        # [1, L] int64, 0=vision-pad(video) 1=text
-    keyframes: list = field(default_factory=list)      # fl2va: [{resolved_frame_index, latent}]
-    refs: list = field(default_factory=list)           # ref2va: [{kind, latent, ...}]
-    frame_count: Optional[int] = None
+    """Composed text + media conditioning consumed by the sampler."""
+
+    text: TextConditioning
+    media: MediaConditioning = field(default_factory=MediaConditioning)
+    segment_texts: tuple[TextConditioning, ...] = ()
+    segment_negative_texts: tuple[TextConditioning, ...] = ()
     visual_cond_noise_aug: float = 0.999
     audio_cond_noise_aug: float = 1.0
     seed: int = 0
+    fl_constraint: Optional[dict] = None
+    av_encoder: Optional[Any] = None
 
     def to_payload(self) -> dict:
         payload = {
-            "text_token_tags": self.text_token_tags,
+            "text_token_tags": self.text.tags,
             "visual_cond_noise_aug": self.visual_cond_noise_aug,
             "audio_cond_noise_aug": self.audio_cond_noise_aug,
             "seed": self.seed,
         }
-        if self.keyframes:
-            payload["keyframes"] = self.keyframes
-            payload["frame_count"] = self.frame_count
-            payload["cond_video_latents"] = [kf["latent"] for kf in self.keyframes]
-        if self.refs:
-            payload["refs"] = self.refs
-            payload["cond_video_latents"] = [r["latent"] for r in self.refs if "latent" in r]
-            payload["cond_audio_latents"] = [r["audio_latent"] for r in self.refs
-                                             if r.get("audio_latent") is not None]
+        payload.update(self.media.to_payload())
         return payload
 
 
@@ -436,6 +531,18 @@ class AVLatent:
         return self.video.shape, self.audio.shape
 
 
+@dataclass(frozen=True)
+class SamplerRequest:
+    """One k-diffusion sampling run request."""
+
+    latent: AVLatent
+    seed: int = 0
+    payload: Optional[dict] = None
+    negative_payload: Optional[dict] = None
+    positive_text: Optional[TextConditioning] = None
+    negative_text: Optional[TextConditioning] = None
+
+
 # ---------------------------------------------------------------------------
 # Sampler output
 # ---------------------------------------------------------------------------
@@ -446,7 +553,6 @@ class H3SampleResult:
     video: torch.Tensor
     audio: torch.Tensor
     steps: int
-    sigmas: torch.Tensor
     swap_hits: int = 0          # blocks reused from the GPU ring
     swap_loads: int = 0         # blocks pulled from RAM/disk
     peak_vram_mb: float = 0.0
@@ -459,3 +565,342 @@ class H3SampleResult:
     @property
     def av(self) -> AVLatent:
         return AVLatent(video=self.video, audio=self.audio)
+
+
+@dataclass(frozen=True)
+class BlockSwapStats:
+    """Snapshot of BlockSwap counters consumed by sampling runners."""
+
+    swap_hits: int = 0
+    swap_loads: int = 0
+    home_size: int = 0
+    total: int = 0
+    window: int = 0
+    hot: int = 0
+    disk_reads: int = 0
+    d2h_stage: int = 0
+    d2h_direct: int = 0
+    d2h_host_register: int = 0
+    d2h_sync: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Rolling FL2VA contract
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FLKeyframe:
+    """One user-defined timeline keyframe."""
+
+    time: float
+    image_path: str = ""
+    image: Optional[torch.Tensor] = None
+    prompt: str = ""
+    negative_prompt: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class FLConstraint:
+    """Parsed front-end FL Constraint data."""
+
+    fps: int = 24
+    keyframes: tuple[FLKeyframe, ...] = ()
+    offload_dit: bool = False
+    audio_loudness_match: bool = True
+    global_negative_prompt: str = ""
+
+    @classmethod
+    def from_json(cls, raw: str) -> "FLConstraint":
+        import json
+
+        data = json.loads(raw or "{}")
+        fps = int(data.get("fps") or 24)
+        offload_dit = bool(data.get("offload_dit") or False)
+        audio_loudness_match = bool(data.get("audio_loudness_match", True))
+        global_negative_prompt = str(data.get("global_negative_prompt") or "")
+        kfs = []
+        for item in data.get("keyframes") or []:
+            kfs.append(FLKeyframe(
+                time=float(item.get("time") or 0.0),
+                image_path=str(item.get("image_path") or ""),
+                image=item.get("image"),
+                prompt=str(item.get("prompt") or ""),
+                negative_prompt=str(item.get("negative_prompt") or ""),
+                note=str(item.get("note") or ""),
+            ))
+        return cls(
+            fps=fps,
+            keyframes=tuple(kfs),
+            offload_dit=offload_dit,
+            audio_loudness_match=audio_loudness_match,
+            global_negative_prompt=global_negative_prompt,
+        )
+
+
+@dataclass(frozen=True)
+class RollingSegment:
+    """One legal FL2VA segment inside a rolling plan."""
+
+    start_time: float
+    end_time: float
+    frame_count: int
+    latent_t: int
+    audio_t: int
+    start_image: Optional[torch.Tensor] = None
+    end_image: Optional[torch.Tensor] = None
+    prompt: str = ""
+    negative_prompt: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class RollingPlan:
+    """Fully resolved rolling segments for one sampling run."""
+
+    segments: tuple[RollingSegment, ...]
+    width: int
+    height: int
+    fps: int = 24
+
+
+# ---------------------------------------------------------------------------
+# Sampling / session contract
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SamplingConfig:
+    """Sampler knobs extracted once from node inputs."""
+
+    steps: int
+    cfg: float
+    seed: int
+    sampler_name: str
+    scheduler_name: str
+    shift_video: float
+    shift_audio: float
+    use_adaln_cache: bool
+    adaln_prebake_batch: int
+    width: int
+    height: int
+    denoise: float = 1.0
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    """Runtime injection data; never mutated after construction."""
+
+    swap: Optional[H3BlockSwap] = None
+    teacache: Optional[H3TeaCache] = None
+
+    def make_teacache(self, model):
+        """Attach TeaCache hooks to the model, or return None when disabled."""
+        if self.teacache is None:
+            return None
+        from .teacache import TeaCache
+        return TeaCache(
+            model,
+            start_block=self.teacache.start_block,
+            max_skip_blocks=self.teacache.max_skip_blocks,
+            rel_l1_thresh=self.teacache.rel_l1_thresh,
+            warmup_steps=self.teacache.warmup_steps,
+            cooldown_steps=self.teacache.cooldown_steps,
+        )
+
+
+@dataclass(frozen=True)
+class SamplingAssets:
+    """Everything a sampling run needs besides sampler knobs."""
+
+    handle: Any
+    positive: H3Conditioning
+    negative: Optional[H3Conditioning]
+    fl_constraint: FLConstraint
+    av_encoder: Any
+    runtime: RuntimeOptions = field(default_factory=RuntimeOptions)
+    vram_spec: Optional[SequenceSpec] = None
+    latent: Optional[AVLatent] = None
+
+
+@dataclass(frozen=True)
+class ForwardRequest:
+    """One k-diffusion forward wrapper request."""
+
+    model: Any
+    cfg: float
+    video_shape: tuple
+    audio_shape: tuple
+    positive_text: TextConditioning
+    positive_payload: dict
+    negative_text: Optional[TextConditioning] = None
+    negative_payload: Optional[dict] = None
+    shift_video: float = 12.0
+    shift_audio: float = 3.0
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    """Runtime view handed to sampler/runner modules."""
+
+    model: Any
+    reader: Optional[Any]
+    vae: Any
+    positive_text: TextConditioning
+    negative_text: Optional[TextConditioning]
+    sigmas: torch.Tensor
+    teacache: Optional[Any]
+    adaln_cache: Optional[AdaLNCache]
+    device: torch.device
+    dtype: torch.dtype
+    positive_payload: Optional[dict] = None
+    negative_payload: Optional[dict] = None
+    block_stats: Optional[BlockSwapStats] = None
+
+
+@dataclass(frozen=True)
+class SegmentRequest:
+    """One rolling segment sampling request."""
+
+    segment: RollingSegment
+    start_latent: torch.Tensor
+    end_latent: Optional[torch.Tensor] = None
+    seed: int = 0
+
+
+@dataclass(frozen=True)
+class SegmentResult:
+    """Sampled latent plus per-segment stats."""
+
+    latent: AVLatent
+    swap_hits: int = 0
+    swap_loads: int = 0
+    peak_vram_mb: float = 0.0
+
+
+@dataclass(frozen=True)
+class DecodedSegment:
+    """Decoded rolling segment and the next segment's start latent."""
+
+    video: torch.Tensor          # CPU [T,H,W,3]
+    audio: torch.Tensor          # CPU waveform
+    next_start_latent: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RollingOutput:
+    """Final rolling sampling result."""
+
+    video: torch.Tensor
+    audio: torch.Tensor
+    stats: str
+    segment_count: int
+    peak_vram_mb: float
+
+
+# ---------------------------------------------------------------------------
+# VRAM / BlockSwap planning contract
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SequenceSpec:
+    """Typed sequence used by VRAM estimators."""
+
+    text_len: int
+    latent_t: int
+    latent_h: int
+    latent_w: int
+    audio_t: int
+    media: MediaConditioning = field(default_factory=MediaConditioning)
+    cfg: float = 1.0
+
+
+@dataclass(frozen=True)
+class VRAMEstimate:
+    """Estimated non-weight VRAM for one sequence."""
+
+    sequence_tokens: int
+    activation_mb: float
+    comfy_reserve_mb: float
+    perf_headroom_mb: float
+    runtime_lora_total_mb: float
+    runtime_lora_fixed_mb: float
+
+    @property
+    def reserve_mb(self) -> float:
+        return (
+            self.activation_mb
+            + self.comfy_reserve_mb
+            + self.perf_headroom_mb
+        )
+
+
+@dataclass(frozen=True)
+class PoolPlan:
+    """Final BlockSwap pool geometry after VRAM planning."""
+
+    block_mb: float
+    free_mb: float
+    effective_reserve_mb: float
+    lora_per_slot_mb: float
+    max_slots: int
+    requested_slots: int
+    window_size: int
+    hot_blocks: int
+    prefetch_count: int
+    home_slots: int
+    gpu_slots: int
+
+
+@dataclass(frozen=True)
+class SwapAllocation:
+    """Effective swap config plus resolved pool geometry."""
+
+    config: H3BlockSwap
+    pool: PoolPlan
+
+
+__all__ = [
+    "LoadingMode",
+    "CondKind",
+    "AdaLNCacheKey",
+    "AdaLNCacheEntry",
+    "AdaLNCache",
+    "H3BlockSwap",
+    "H3TeaCache",
+    "EncoderStreamConfig",
+    "VAERef",
+    "AttentionConfig",
+    "SlotEntry",
+    "SwapBlock",
+    "LoraEntry",
+    "AdaLNOverride",
+    "H3Lora",
+    "H3LoraSet",
+    "TextConditioning",
+    "KeyframeCondition",
+    "ReferenceCondition",
+    "MediaConditioning",
+    "H3Conditioning",
+    "AVLatent",
+    "H3SampleResult",
+    "BlockSwapStats",
+    "FLKeyframe",
+    "FLConstraint",
+    "RollingSegment",
+    "RollingPlan",
+    "SamplingConfig",
+    "RuntimeOptions",
+    "SamplingAssets",
+    "ForwardRequest",
+    "SessionContext",
+    "SamplerRequest",
+    "SegmentRequest",
+    "SegmentResult",
+    "DecodedSegment",
+    "RollingOutput",
+    "SequenceSpec",
+    "VRAMEstimate",
+    "PoolPlan",
+    "SwapAllocation",
+    "_params_extra_fields",
+]

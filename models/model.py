@@ -12,7 +12,7 @@ ComfyUI imports removed:
 
 The forward returns the **flow velocity** on both streams
 ``(v_video, v_audio)``, i.e. exactly what the ComfyUI model returns
-(``[-video_out, -slope_a * audio_out]``).  A sampler integrates
+(``[-video_out, -audio_out]``).  A sampler integrates
 ``dX/dsigma = v`` on the video sigma grid; the audio velocity already
 includes the schedule-map derivative scaling.
 """
@@ -740,7 +740,7 @@ class MiniMaxH3Model(nn.Module):
     # -- forward ----------------------------------------------------------------
 
     def velocity(self, video_x, audio_x, sigma, text_states, payload=None,
-                 shift_video=None, shift_audio=None, official_av=False):
+                 shift_video=None, shift_audio=None):
         """One denoising step: returns (v_video, v_audio) flow velocities.
 
         ``sigma`` is the *video* sigma in [0,1] (float or 0-d tensor); the
@@ -895,12 +895,5 @@ class MiniMaxH3Model(nn.Module):
         video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
         audio_out = unpack_audio(a)
 
-        slope_a = time_shift_slope(sigma_v, shift_v, shift_a)
-        audio_vel = -audio_out
-        if not official_av:
-            slope_t = torch.tensor(
-                slope_a, dtype=audio_out.dtype, device=audio_out.device)
-            audio_vel = -slope_t * audio_out
         return [-video_out.to(video_x.dtype),
-                audio_vel.to(audio_x.dtype)]
-
+                -audio_out.to(audio_x.dtype)]

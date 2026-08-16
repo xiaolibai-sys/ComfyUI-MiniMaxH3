@@ -16,11 +16,17 @@ from safetensors.torch import save_file
 
 from h3rt.models.model import MiniMaxH3Model
 from h3rt.models.lora import parse_lora_h3
-from h3rt.nodes.h3_sampling import h3_sample
+from h3_test_utils import h3_sample
 from h3rt.utils.config import MiniMaxH3DiTConfig
-from h3rt.utils.injection import InjectionContext
+from h3rt.utils.types import RuntimeOptions
 from h3rt.utils.lifecycle import load_model_handle
-from h3rt.utils.types import AVLatent, H3BlockSwap, H3Conditioning
+from h3rt.utils.types import (
+    AVLatent,
+    H3BlockSwap,
+    H3Conditioning,
+    RuntimeOptions,
+    TextConditioning,
+)
 
 torch.manual_seed(19)
 
@@ -66,12 +72,12 @@ video = torch.randn(1, 4, 2, 16, 16, device=device, dtype=torch.float32)
 audio = torch.randn(1, 8, 2, 8, device=device, dtype=torch.float32)
 text = torch.randn(1, 8, 64, device=device, dtype=torch.float32)
 tags = torch.ones(1, 8, dtype=torch.long, device=device)
-cond = H3Conditioning(text_states=text, text_token_tags=tags)
+cond = H3Conditioning(text=TextConditioning(states=text, tags=tags))
 latent = AVLatent(video=video, audio=audio)
 
 handle = load_model_handle(ckpt_path)
 handle.loras.add(parse_lora_h3(lora_path, strength=1.0))
-injection = InjectionContext.build(block_swap_args=swap)
+injection = RuntimeOptions(swap=swap)
 
 res_eager = h3_sample(
     handle, cond, latent, None, 3, 1.0, "euler",
